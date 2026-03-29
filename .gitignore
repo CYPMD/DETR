@@ -205,3 +205,32 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# DS_Store
+*.DS_Store
+
+# Folders
+.vscode
+.datasets
+voc
+imgs
+DETR-checkpoints
+
+# Rand jsons
+*.json
+
+# MP4 files
+*.mp4
+
+# Images
+*.HEIC
+
+# CSVs
+*.csv
+
+# Temporary ignore those
+plots.ipynb
+visualize.py
+
+# Rand
+*.tar
