@@ -5,15 +5,13 @@ from typing import List, Dict, Tuple, Callable
 from PIL import Image
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 
 import torchvision
 from torchvision.datasets import VOCDetection
 
 from src.data.constants import (
     CLASSES,
-    CLASS_TO_IDX,
-    CLASS_IDX_TO_NAME, 
 )
 
 
@@ -27,7 +25,18 @@ class VOC(Dataset):
     ) -> None:
         super().__init__()
 
-        self.voc = VOCDetection(root, year="2012", image_set=image_set, download=download)
+        # self.voc = VOCDetection(root, year="2012", image_set=image_set, download=download)
+        if image_set == "train": 
+            self.voc = ConcatDataset([
+                VOCDetection(root, year="2012", image_set="train", download=download),
+                VOCDetection(root, year="2012", image_set="val", download=True),
+                VOCDetection(root, year="2007", image_set="train", download=True),
+                VOCDetection(root, year="2007", image_set="val", download=True)
+            ])
+        elif image_set == "val":
+            self.voc = VOCDetection(root, year="2007", image_set="test", download=download)
+        else:
+            raise ValueError(f"Unknown image_set: {image_set}")
 
         self.root = root
         self.download = download

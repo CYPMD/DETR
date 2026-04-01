@@ -1,14 +1,15 @@
 from typing import Tuple
+from itertools import chain
 
 import torch
 import torch.nn as nn
 
-from torchvision.models import resnet101, ResNet101_Weights
+from torchvision.models import resnet101, ResNet101_Weights, resnet50, ResNet50_Weights
 
 
-class ResNet101Backbone(nn.Module):
+class ResNet50Backbone(nn.Module):
     """
-    Pretrained ResNet-101 backbone.
+    Pretrained ResNet-50 backbone.
     
     Reference:
     ----------
@@ -18,26 +19,17 @@ class ResNet101Backbone(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        resnet = resnet101(weights=ResNet101_Weights.IMAGENET1K_V2)
+        resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
 
-        # NOTE: Freezing nearly the entire backbone is not standard in DETR.
-        # I don't have enough compute to include more backbone training :( 
-        for p in resnet.parameters():
-            p.requires_grad = False
-
-        # But im unfreezing layer4 :)
-        for p in resnet.layer4.parameters():
-            p.requires_grad = True
-        
         # [N, 3, H_0, W_0] -> [N, 2048, H, W]
-        self.resnet101 = nn.Sequential(
+        self.resnet50 = nn.Sequential(
             *list(resnet.children())[:-2]
         )
 
         self._freeze_batch_norm()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_feat = self.resnet101(x)
+        x_feat = self.resnet50(x)
         return x_feat
 
     def train(self, mode: bool = True):
@@ -47,11 +39,11 @@ class ResNet101Backbone(nn.Module):
 
     def _freeze_batch_norm(self) -> None:
         # Freeze all BatchNorm layers
-        for m in self.resnet101.modules():
+        for m in self.resnet50.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
-            for p in m.parameters():
-                p.requires_grad = False
+                for p in m.parameters():
+                    p.requires_grad = False
 
 
 class SpatialToSequence(nn.Module):
@@ -348,7 +340,7 @@ class DETR(nn.Module):
         self.num_queries = num_queries
 
         # [B, 3, W_0, H_0] -> [B, 2048, W, H]        
-        self.backbone = ResNet101Backbone()
+        self.backbone = ResNet50Backbone()
 
         # [B, 2048, W, H] -> [B, W * H, d_model] (now a sequence suitable for transformers)
         self.spatial_to_sequence = SpatialToSequence(2048, d_model)
@@ -381,6 +373,8 @@ class DETR(nn.Module):
             nn.Sigmoid()
         )
 
+        self._init_params()
+
     def forward(self, x_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Input image x_img has shape:                  # [B, 3, H_0, W_0]
         x_feat = self.backbone(x_img)                   # [B, 2048, H, W]
@@ -398,3 +392,20 @@ class DETR(nn.Module):
         x_logits = self.proj_class(x_tr)                # [B, num_queries, n_classes]
         x_bbox = self.proj_bbox(x_tr)                   # [B, num_queries, 4]
         return x_logits, x_bbox
+    
+    def _init_params(self) -> None:
+        modules = chain(
+            self.transformer.modules(),
+            self.proj_bbox.modules(),
+            self.proj_class.modules(),
+            self.spatial_to_sequence.modules() 
+        ) 
+        for m in modules:
+            if isinstance(m, nn.Linear): 
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d): 
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)

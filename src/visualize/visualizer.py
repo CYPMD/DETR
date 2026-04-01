@@ -315,7 +315,7 @@ class DETRVisualizer:
             obj_prob: float, 
             obj_color: Tuple[float, float, float]
     ) -> None:
-        """Draws object metainformation on on Axes object.
+        """Draws object metainformation on an Axes object.
 
         Args:
         -----

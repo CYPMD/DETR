@@ -145,10 +145,7 @@ class DETRTrainer:
                 loss_aux, _, _ = self.criterion(logits_aux, boxes_aux, targets)
                 loss_aux_total += loss_aux
 
-            if n_aux > 0:
-                loss_aux_total /= n_aux
-            
-            # Compute final loss 
+            # Compute final loss
             loss = loss + loss_aux_total
 
             # Backpropagation
@@ -160,7 +157,6 @@ class DETRTrainer:
                 nn.utils.clip_grad_norm_(self.detr.parameters(), self.clip_grad_norm) 
 
             self.optimizer.step()
-            #self.optimizer_backbone.step()
 
     def evaluate(self, dataloader: DataLoader, epoch: int, train_set: bool = False) -> None:
         history = self.evaluator.evaluate(dataloader)
