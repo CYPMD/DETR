@@ -229,7 +229,6 @@ DETR-checkpoints
 *.csv
 
 # Temporary ignore those
-plots.ipynb
 visualize.py
 
 # Rand

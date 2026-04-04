@@ -112,7 +112,8 @@ class DETRVisualizer:
             self, 
             video_file: str, 
             score_thresh: float=0.5, 
-            nms_iou_thresh: float | None = None
+            nms_iou_thresh: float | None = None,
+            detect_every: int=2
     ) -> None:
         """Opens video file using openCV and detects objects in video stream.
 
@@ -122,7 +123,8 @@ class DETRVisualizer:
         nms_iou_thresh : nms threshold (actually not needed if trained properly)
         """ 
         cap = cv.VideoCapture(video_file)
-        
+        t = 0
+
         while cap.isOpened():
             # Capture frame
             ret, frame = cap.read()
@@ -135,18 +137,21 @@ class DETRVisualizer:
             img_tensor, img_size = self._convert_from_numpy(frame)
             
             # DETR inference
-            logits, boxes_pred = self.detr(img_tensor)
-            scores, labels, boxes = extract_boxes(
-                logits, boxes_pred, score_thresh, nms_iou_thresh
-            )
+            if t % detect_every == 0: 
+                logits, boxes_pred = self.detr(img_tensor)
+                scores, labels, boxes = extract_boxes(
+                    logits, boxes_pred, score_thresh, nms_iou_thresh
+                )
 
             # Visualize
             self._visualize_boxes_cv(frame, labels, scores, boxes, img_size)
             cv.imshow('frame', frame)
-            
+            t += 1
+
             if cv.waitKey(1) == ord('q'):
                 break
-        
+
+
         cap.release()
         cv.destroyAllWindows()
 
@@ -169,7 +174,12 @@ class DETRVisualizer:
         logits, boxes_pred = self.detr(img_tensor)
         scores, labels, boxes = extract_boxes(logits, boxes_pred, score_thresh, nms_iou_thresh)
 
-        fig, ax = plt.subplots()        
+        w, h = img.size
+        fig_width= 10
+        fig_height = fig_width * h / w
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))       
+
+        # fig, ax = plt.subplots()        
         ax.axis("off") 
 
         ax.imshow(img)
@@ -208,7 +218,12 @@ class DETRVisualizer:
             logits, boxes_pred, attention_weights, score_thresh, nms_iou_thresh
         ) 
 
-        fig, ax = plt.subplots()        
+        w, h = img.size
+        fig_width= 10
+        fig_height = fig_width * h / w
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))        
+
+        # fig, ax = plt.subplots()        
         ax.axis("off") 
 
         ax.imshow(img)
@@ -219,9 +234,16 @@ class DETRVisualizer:
 
             _, obj_prob, obj_name, obj_color = self._get_detection_metadata(labels, scores, i)
 
+            x1 = max(0, int(round(x)))
+            y1 = max(0, int(round(y)))
+            x2 = min(img_size[0], int(round(x + w)))
+            y2 = min(img_size[1], int(round(y + h))) 
+            
             # Draw attention weight
             weight = self._upsample_attention_map(attention_weights[i], img_size)
-            ax.imshow(weight, alpha=0.2, cmap="jet")
+            masked = np.ma.masked_all_like(weight) 
+            masked[y1:y2, x1:x2] = weight[y1:y2, x1:x2]
+            ax.imshow(masked, alpha=0.2, cmap="jet")
 
             # Draw rectangle
             obj_rect = patches.Rectangle(
@@ -373,7 +395,7 @@ class DETRVisualizer:
         
         w_img, h_img = img_size     # Original image size
         weight = torch.nn.functional.interpolate(
-            weight, (h_img, w_img), mode="bilinear", align_corners=False
+            weight, (h_img, w_img), mode="bilinear"
         )                                                               # [1, 1, H * W] -> [1, 1, H_0, W_0]
         weight = weight.squeeze(0).squeeze(0).detach().cpu().numpy()    # [H_0, W_0]
         return weight
