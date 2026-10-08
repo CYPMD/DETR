@@ -1,4 +1,5 @@
 from argparse import Namespace, ArgumentParser
+from time import perf_counter
 from typing import Any, List, Tuple, Dict
 
 import numpy as np
@@ -43,7 +44,12 @@ def parse_args() -> Namespace:
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--root", type=str, default="./voc")
-    parser.add_argument("--download", type=bool, default=True)
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        default=False,
+        help="Download and extract VOC archives. Omit when the dataset is already extracted.",
+    )
     parser.add_argument("--img_size", type=tuple, default=(640, 640))
 
     parser.add_argument("--save_every", type=int, default=5)
@@ -65,8 +71,17 @@ def set_seeds(seed: int) -> None:
 
 def main() -> None:
     args = parse_args() 
+    startup_started = perf_counter()
+
+    def log_startup(message: str) -> None:
+        if args.verbose:
+            elapsed = perf_counter() - startup_started
+            print(f"[startup +{elapsed:.1f}s] {message}", flush=True)
+
+    log_startup("Setting random seeds...")
     set_seeds(args.seed) 
     
+    log_startup("Building DETR (ResNet-50 weights may download if not cached)...")
     detr = DETR(
         args.d_model, 
         args.encoder_layers,
@@ -79,13 +94,21 @@ def main() -> None:
         args.dropout,
         args.max_tokens
     )
+    log_startup("Model ready.")
 
     pin_mem = True if args.num_workers > 0 else False
     
     train_transform = TrainTransform(args.img_size) 
     val_transform = ValidationTransform(args.img_size)
 
-    train_set = VOC(root=args.root, image_set="train", transform=train_transform)
+    log_startup(f"Loading training data from {args.root} (download={args.download})...")
+    train_set = VOC(
+        root=args.root,
+        image_set="train",
+        transform=train_transform,
+        download=args.download,
+    )
+    log_startup(f"Training dataset ready: {len(train_set):,} images.")
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -95,7 +118,14 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    val_set = VOC(root=args.root, image_set="val", transform=val_transform)
+    log_startup(f"Loading evaluation data from {args.root} (download={args.download})...")
+    val_set = VOC(
+        root=args.root,
+        image_set="val",
+        transform=val_transform,
+        download=args.download,
+    )
+    log_startup(f"Evaluation dataset ready: {len(val_set):,} images.")
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
@@ -105,6 +135,7 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
+    log_startup(f"Initializing trainer on {args.device}...")
     trainer = DETRTrainer(
         detr=detr,
         n_epochs=args.n_epochs,
@@ -124,6 +155,10 @@ def main() -> None:
         verbose=args.verbose,
     ) 
 
+    log_startup(
+        f"Starting training: {args.n_epochs} epochs, "
+        f"{len(train_loader):,} batches per epoch, {args.num_workers} data workers."
+    )
     trainer.train(train_loader, val_loader)
 
 
