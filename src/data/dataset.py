@@ -21,7 +21,7 @@ class VOC(Dataset):
             root: str,
             transform: Callable | None=None, 
             image_set: str="train",
-            download: bool=True
+            download: bool=False
     ) -> None:
         super().__init__()
 
@@ -29,9 +29,9 @@ class VOC(Dataset):
         if image_set == "train": 
             self.voc = ConcatDataset([
                 VOCDetection(root, year="2012", image_set="train", download=download),
-                VOCDetection(root, year="2012", image_set="val", download=True),
-                VOCDetection(root, year="2007", image_set="train", download=True),
-                VOCDetection(root, year="2007", image_set="val", download=True)
+                VOCDetection(root, year="2012", image_set="val", download=download),
+                VOCDetection(root, year="2007", image_set="train", download=download),
+                VOCDetection(root, year="2007", image_set="val", download=download)
             ])
         elif image_set == "val":
             self.voc = VOCDetection(root, year="2007", image_set="test", download=download)
