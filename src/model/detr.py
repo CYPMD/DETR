@@ -4,7 +4,9 @@ from itertools import chain
 import torch
 import torch.nn as nn
 
-from torchvision.models import resnet101, ResNet101_Weights, resnet50, ResNet50_Weights
+from torchvision.models import resnet50, ResNet50_Weights
+
+from src.model.vit import ViTPatchEncoder
 
 
 class ResNet50Backbone(nn.Module):
@@ -16,10 +18,11 @@ class ResNet50Backbone(nn.Module):
     Deep Residual Learning for Image Recognition, He et al., 2015
     https://arxiv.org/abs/1512.03385
     """ 
-    def __init__(self) -> None:
+    def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
 
-        resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+        resnet = resnet50(weights=weights)
 
         # [N, 3, H_0, W_0] -> [N, 2048, H, W]
         self.resnet50 = nn.Sequential(
@@ -82,6 +85,12 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Input image x has shape:                          # [B, W * H, d_model]
         B, L, d_model = x.shape
+
+        if L > self.pos.shape[1]:
+            raise ValueError(
+                f"ResNet produced {L} tokens, but max_tokens={self.pos.shape[1]}. "
+                "Increase --max_tokens or reduce --img_size."
+            )
 
         pos = self.pos[:, :L, :].expand(B, L, d_model)      # [B, W * H, d_model]
 
@@ -302,6 +311,27 @@ class Transformer(nn.Module):
         return x_dec
 
 
+class ViTTransformer(nn.Module):
+    """Pretrained image encoder followed by the repository's DETR decoder."""
+
+    def __init__(
+            self, decoder_layers: int, decoder_heads: int, d_model: int,
+            ff_dim: int, dropout: float, pretrained: bool, freeze_encoder: bool,
+    ) -> None:
+        super().__init__()
+        self.encoder = ViTPatchEncoder(pretrained=pretrained, frozen=freeze_encoder)
+        self.input_proj = nn.Linear(self.encoder.hidden_dim, d_model)
+        self.position_proj = nn.Linear(self.encoder.hidden_dim, d_model, bias=False)
+        self.decoder = Decoder(decoder_layers, decoder_heads, d_model, ff_dim, dropout)
+
+    def forward(self, images: torch.Tensor, queries: Queries) -> torch.Tensor:
+        memory, positions = self.encoder(images)
+        memory = self.input_proj(memory)
+        positions = self.position_proj(positions)
+        query = queries(memory)
+        return self.decoder(memory, torch.zeros_like(query), positions, query)
+
+
 class DETR(nn.Module):
     """
     Detection Transformer.
@@ -323,12 +353,20 @@ class DETR(nn.Module):
             ff_dim: int=2048,
             dropout: float=0.1,
             max_tokens: int=400,
+            *,
+            architecture: str="resnet50",
+            pretrained: bool=True,
+            freeze_encoder: bool=False,
     ) -> None:
         """
         Detection Transformer
 
-        NOTE: Expected foreground classes are 0, ..., n_classes - 1,
-        with an empty_set_class_id = n_classes. 
+        n_classes INCLUDES no-object: foreground IDs are 0..n_classes-2,
+        and the no-object ID is n_classes-1 (VOC: 21 outputs).
+
+        architecture="resnet50" preserves the original parameter names.
+        architecture="vit_b_32" replaces both ResNet and the DETR encoder.
+        encoder_layers, encoder_heads and max_tokens apply only to ResNet.
         
         Reference:
         ---------- 
@@ -336,22 +374,45 @@ class DETR(nn.Module):
         https://arxiv.org/abs/2005.12872 
         """ 
         super().__init__()
+        if architecture not in {"resnet50", "vit_b_32"}:
+            raise ValueError(f"Unknown architecture: {architecture}")
+        if d_model <= 0 or decoder_heads <= 0 or d_model % decoder_heads:
+            raise ValueError("d_model must be positive and divisible by decoder_heads")
+        if decoder_layers < 1 or n_classes < 2 or num_queries < 1:
+            raise ValueError("Need decoder_layers >= 1, n_classes >= 2 and num_queries >= 1")
+        if architecture == "resnet50":
+            if encoder_layers < 1 or encoder_heads <= 0 or d_model % encoder_heads:
+                raise ValueError("Need encoder_layers >= 1 and d_model divisible by encoder_heads")
+            if not isinstance(max_tokens, int) or max_tokens < 1:
+                raise ValueError("max_tokens must be a positive integer")
+
+        self.architecture = architecture
         self.n_classes = n_classes
         self.num_queries = num_queries
-
-        # [B, 3, W_0, H_0] -> [B, 2048, W, H]        
-        self.backbone = ResNet50Backbone()
-
-        # [B, 2048, W, H] -> [B, W * H, d_model] (now a sequence suitable for transformers)
-        self.spatial_to_sequence = SpatialToSequence(2048, d_model)
-
-        # [B, d_model, W * H] -> [B, num_queries, d_model]
-        self.transformer = Transformer(
-            encoder_layers, encoder_heads, decoder_layers, decoder_heads, d_model, ff_dim, dropout
+        self.feature_grid_size = None
+        self.model_config = dict(
+            d_model=d_model, encoder_layers=encoder_layers, encoder_heads=encoder_heads,
+            decoder_layers=decoder_layers, decoder_heads=decoder_heads,
+            n_classes=n_classes, num_queries=num_queries, ff_dim=ff_dim,
+            dropout=dropout, max_tokens=max_tokens, architecture=architecture,
+            pretrained=pretrained, freeze_encoder=freeze_encoder,
         )
 
-        # [B, W * H, d_model] -> [B, W * H, d_model]
-        self.pos_enc = PositionalEncoding(max_tokens, d_model)
+        if architecture == "resnet50":
+            self.backbone = ResNet50Backbone(pretrained=pretrained)
+            self.spatial_to_sequence = SpatialToSequence(2048, d_model)
+            self.transformer = Transformer(
+                encoder_layers, encoder_heads, decoder_layers, decoder_heads,
+                d_model, ff_dim, dropout,
+            )
+            self.pos_enc = PositionalEncoding(max_tokens, d_model)
+            if freeze_encoder:
+                self.backbone.requires_grad_(False)
+        else:
+            self.transformer = ViTTransformer(
+                decoder_layers, decoder_heads, d_model, ff_dim, dropout,
+                pretrained=pretrained, freeze_encoder=freeze_encoder,
+            )
 
         # [] -> [B, num_queries, d_model] 
         self.queries = Queries(num_queries, d_model) 
@@ -376,30 +437,40 @@ class DETR(nn.Module):
         self._init_params()
 
     def forward(self, x_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Input image x_img has shape:                  # [B, 3, H_0, W_0]
-        x_feat = self.backbone(x_img)                   # [B, 2048, H, W]
-
-        x_feat = self.spatial_to_sequence(x_feat)       # [B, H * W, d_model]
-        
-        pos_enc = self.pos_enc(x_feat)                  # [B, H * W, d_model]
-        queries = self.queries(x_feat)                  # [B, num_queries, d_model]
-        x_dec = torch.zeros_like(queries)               # [B, num_queries, d_model]
-
-        x_tr = self.transformer(
-            x_feat, x_dec, pos_enc, queries
-        )                                               # [B, num_queries, d_model]
+        if self.architecture == "resnet50":
+            x_feat = self.backbone(x_img)
+            self.feature_grid_size = tuple(x_feat.shape[-2:])
+            x_feat = self.spatial_to_sequence(x_feat)
+            pos_enc = self.pos_enc(x_feat)
+            queries = self.queries(x_feat)
+            x_tr = self.transformer(x_feat, torch.zeros_like(queries), pos_enc, queries)
+        else:
+            x_tr = self.transformer(x_img, self.queries)
+            self.feature_grid_size = (x_img.shape[-2] // 32, x_img.shape[-1] // 32)
 
         x_logits = self.proj_class(x_tr)                # [B, num_queries, n_classes]
         x_bbox = self.proj_bbox(x_tr)                   # [B, num_queries, 4]
         return x_logits, x_bbox
+
+    def pretrained_parameters(self):
+        """Parameters assigned the smaller feature-encoder learning rate."""
+        if self.architecture == "resnet50":
+            return self.backbone.parameters()
+        return self.transformer.encoder.parameters()
     
     def _init_params(self) -> None:
-        modules = chain(
-            self.transformer.modules(),
-            self.proj_bbox.modules(),
-            self.proj_class.modules(),
-            self.spatial_to_sequence.modules() 
-        ) 
+        if self.architecture == "resnet50":
+            modules = chain(
+                self.transformer.modules(), self.proj_bbox.modules(),
+                self.proj_class.modules(), self.spatial_to_sequence.modules(),
+            )
+        else:
+            # Do not walk transformer.modules(): that would overwrite pretrained ViT!
+            modules = chain(
+                self.transformer.decoder.modules(), self.transformer.input_proj.modules(),
+                self.transformer.position_proj.modules(), self.proj_bbox.modules(),
+                self.proj_class.modules(),
+            )
         for m in modules:
             if isinstance(m, nn.Linear): 
                 nn.init.xavier_uniform_(m.weight)

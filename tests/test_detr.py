@@ -22,6 +22,7 @@ def detr_model(device):
         num_queries=100,
         ff_dim=2048,
         dropout=0.1,
+        pretrained=False,  # Unit tests must not download ResNet weights.
     ).to(device)
     return model
 

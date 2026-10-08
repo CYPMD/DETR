@@ -1,6 +1,8 @@
 from argparse import Namespace, ArgumentParser
 from time import perf_counter
 from typing import Any, List, Tuple, Dict
+from pathlib import Path
+import random
 
 import numpy as np
 
@@ -8,29 +10,39 @@ import torch
 from torch.utils.data import DataLoader
 
 
-from src import DETR, DETRTrainer
+from src import DETR, DETRTrainer, load_weights, load_decoder_weights
 from src import VOC, TrainTransform, ValidationTransform
 
 
-def parse_args() -> Namespace:
+def parse_args(argv=None) -> Namespace:
     parser = ArgumentParser(description="DETR training")
+
+    parser.add_argument("--model", choices=("resnet50", "vit_b_32"), default="resnet50")
+    parser.add_argument("--no_pretrained", action="store_true", help="Random feature-encoder initialization; also useful offline")
+    parser.add_argument("--freeze_encoder", action="store_true", help="Freeze ViT, or the ResNet backbone in baseline mode")
+    initializers = parser.add_mutually_exclusive_group()
+    initializers.add_argument("--weights", type=str, help="Strictly load complete detection weights; starts a new optimizer")
+    initializers.add_argument("--init_decoder_from", type=str, help="Warm-start matching queries, decoder and detection heads")
+    parser.add_argument("--output_dir", type=str, default=None, help="Default: runs/<model>; use a unique directory per experiment")
 
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--encoder_heads", type=int, default=8)
     parser.add_argument("--decoder_layers", type=int, default=6)
     parser.add_argument("--decoder_heads", type=int, default=8)
-    parser.add_argument("--n_classes", type=int, default=21)            # n_classes + 1
+    parser.add_argument("--n_classes", type=int, default=21, help="Total outputs INCLUDING no-object: VOC=21")
     parser.add_argument("--num_queries", type=int, default=100)
     parser.add_argument("--ff_dim", type=int, default=2048)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--max_tokens", type=float, default=400)        # (img_size[0] / 32) * (img_size[1] / 32)
+    parser.add_argument("--max_tokens", type=int, default=400, help="ResNet positional capacity; ignored by ViT")
 
     parser.add_argument("--n_epochs", type=int, default=150)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--learning_rate_backbone", type=float, default=5e-5)
+    parser.add_argument("--learning_rate_encoder", type=float, default=1e-5, help="ViT learning rate; baseline uses learning_rate_backbone")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--weight_decay_backbone", type=float, default=1e-4)
+    parser.add_argument("--weight_decay_encoder", type=float, default=1e-4, help="ViT weight decay")
     parser.add_argument("--batch_size", type=int, default=4)            # Limited by my compute
     parser.add_argument("--lambda_l1", type=float, default=5.0)
     parser.add_argument("--lambda_giou", type=float, default=2.0)
@@ -50,12 +62,31 @@ def parse_args() -> Namespace:
         default=False,
         help="Download and extract VOC archives. Omit when the dataset is already extracted.",
     )
-    parser.add_argument("--img_size", type=tuple, default=(640, 640))
+    parser.add_argument("--img_size", type=int, nargs=2, default=(640, 640), metavar=("HEIGHT", "WIDTH"))
 
     parser.add_argument("--save_every", type=int, default=5)
     parser.add_argument("--eval_every", type=int, default=5)
-    parser.add_argument("--verbose", default=True)
-    return parser.parse_args()
+    parser.add_argument("--verbose", default=True)  # Preserve the existing argument.
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+    args.img_size = tuple(args.img_size)
+    args.verbose = str(args.verbose).lower() not in {"false", "0", "no"} and not args.quiet
+    if any(size <= 0 for size in args.img_size):
+        parser.error("--img_size dimensions must be positive")
+    if args.model == "vit_b_32" and any(size % 32 for size in args.img_size):
+        parser.error("ViT-B/32 requires --img_size dimensions divisible by 32")
+    if args.model == "resnet50":
+        tokens = ((args.img_size[0] + 31) // 32) * ((args.img_size[1] + 31) // 32)
+        if args.max_tokens < tokens:
+            parser.error(f"This image size needs --max_tokens >= {tokens}")
+    for name in ("n_epochs", "batch_size", "save_every", "eval_every", "decay_lr_every"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name} must be positive")
+    if args.output_dir is None:
+        args.output_dir = str(Path("runs") / args.model)
+    if args.freeze_encoder and args.no_pretrained and not args.weights:
+        parser.error("Do not freeze a randomly initialized encoder; use pretrained weights or --weights")
+    return args
 
 
 def collate_fn(batch: Any) -> Tuple[torch.Tensor, List[Dict]]:
@@ -65,6 +96,7 @@ def collate_fn(batch: Any) -> Tuple[torch.Tensor, List[Dict]]:
 
 
 def set_seeds(seed: int) -> None:
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -81,7 +113,9 @@ def main() -> None:
     log_startup("Setting random seeds...")
     set_seeds(args.seed) 
     
-    log_startup("Building DETR (ResNet-50 weights may download if not cached)...")
+    log_startup(f"Building {args.model} DETR (pretrained weights may download if not cached)...")
+    if args.model == "vit_b_32":
+        log_startup("ViT uses 32x32 patches, 12 encoder layers, 12 heads and width 768; d_model controls the decoder.")
     detr = DETR(
         args.d_model, 
         args.encoder_layers,
@@ -92,8 +126,17 @@ def main() -> None:
         args.num_queries,
         args.ff_dim,
         args.dropout,
-        args.max_tokens
+        args.max_tokens,
+        architecture=args.model,
+        pretrained=not args.no_pretrained and args.weights is None,
+        freeze_encoder=args.freeze_encoder,
     )
+    if args.weights:
+        load_weights(detr, args.weights)
+        log_startup("Loaded all detection weights; starting a new optimizer.")
+    elif args.init_decoder_from:
+        load_decoder_weights(detr, args.init_decoder_from)
+        log_startup("Loaded queries, decoder and detection heads from the supplied checkpoint.")
     log_startup("Model ready.")
 
     pin_mem = True if args.num_workers > 0 else False
@@ -153,6 +196,10 @@ def main() -> None:
         eval_every=args.eval_every,
         save_every=args.save_every,
         verbose=args.verbose,
+        learning_rate_encoder=args.learning_rate_encoder,
+        weight_decay_encoder=args.weight_decay_encoder,
+        output_dir=args.output_dir,
+        run_config=vars(args),
     ) 
 
     log_startup(

@@ -1,5 +1,18 @@
 # Detection Transformer (DETR)
 
+This version supports both the original **ResNet-50 DETR** and a **pretrained
+ViT-B/32 DETR** with direct image patches and no ResNet backbone. Start with
+[VIT_GUIDE.md](VIT_GUIDE.md) for installation, model selection, checkpoint
+compatibility, and the complete list of changes.
+
+```bash
+python train.py --model resnet50 --root ./voc --output_dir runs/resnet50
+python train.py --model vit_b_32 --root ./voc --img_size 640 640 --output_dir runs/vit_b32
+```
+
+The historical baseline results below describe only the original ResNet model;
+no detection accuracy results are claimed for the ViT variant.
+
 PyTorch reimplementation of the Detection Transformer model described in the paper ["End-to-End Object Detection with Transformers"](https://arxiv.org/abs/2005.12872) from Carion et al., 2020.
 
 <p align="center">
@@ -24,7 +37,7 @@ from src import DETR
 
 
 detr = DETR(
-    n_classes=90 + 1,      # 90 classes + no-object class
+    n_classes=90 + 1,      # total outputs = 90 foreground + 1 no-object
     num_queries=100,
     d_model=256,
     encoder_layers=6,
@@ -33,12 +46,13 @@ detr = DETR(
     decoder_heads=8,
     ff_dim=2048,
     dropout=0.1,
+    max_tokens=1050,       # ceil(800/32) * ceil(1333/32)
 )
 
 x = torch.randn(1, 3, 800, 1333)
 logits, boxes = detr(x)
 
-print(logits.shape)  # [1, 100, 92]
+print(logits.shape)  # [1, 100, 91]
 print(boxes.shape)   # [1, 100, 4]
 ```
 
@@ -61,7 +75,7 @@ All settings and hyperparameters are listed below in the table.
 | Encoder layers | 6 | 6 |
 | Decoder layers | 6 | 6 |
 | Number of object queries | 100 | 25 |
-| Number of classes | 91 (COCO) | 21 (+ 1 no-object) |
+| Number of classes | 91 (COCO) | 21 (20 foreground + 1 no-object) |
 | Learning rate (transformer) | 1e-4 | 1e-4 |
 | Learning rate (backbone) | 1e-5 | 1e-5 |
 | Weight decay (transformer) | 1e-4 | 1e-4 |

@@ -46,8 +46,8 @@ class DETRVisualizer:
         # Prepare DETR for attention map visualization 
         for decoder in self.detr.transformer.decoder.layers:
             decoder.save_attention_weight_ = True
-        img_w, img_h = img_size     # Pillow width and height style
-        self.attention_size = (img_h // 32, img_w // 32)
+        img_h, img_w = img_size     # Same (height, width) convention as v2.Resize.
+        self.attention_size = ((img_h + 31) // 32, (img_w + 31) // 32)
 
         # Pillow image to torch.Tensor transform
         self.transform = ValidationTransform(img_size)
@@ -209,6 +209,8 @@ class DETRVisualizer:
         # DETR inference
         logits, boxes_pred = self.detr(img_tensor)
         
+        # Use the actual encoder grid, including rectangular inputs.
+        self.attention_size = self.detr.feature_grid_size
         # Cache attention weights
         attention_weights = self.detr.transformer.decoder.attention_weights_
         attention_weights = torch.stack(attention_weights).mean(0).squeeze(0)     # [num_queries, H * W]

@@ -1,0 +1,1382 @@
+diff --git a/CHANGES.md b/CHANGES.md
+new file mode 100644
+--- /dev/null
++++ b/CHANGES.md
+@@ -0,0 +1,48 @@
++# Files to add or replace
++
++All paths below are relative to the repository root. The bundled `changes.patch`
++contains the same changes. The full `cypmd-detr/` folder is already updated.
++
++## New files
++
++| File | Purpose |
++| --- | --- |
++| `src/model/vit.py` | Pretrained ViT-B/32 patch encoder, position interpolation, spatial token output, optional freezing |
++| `src/model/checkpoint.py` | Strict detector loading, self-describing model loading, and validated decoder transfer |
++| `tests/test_vit_detr.py` | Offline integration/gradient/checkpoint tests plus opt-in full ViT and real pretrained checks |
++| `pytest.ini` | Test collection and optional integration/pretraining markers |
++| `requirements-dev.txt` | Test dependencies |
++| `VIT_GUIDE.md` | Architecture, training commands, checkpoint migration, inference and limitations |
++| `VALIDATION.md` | Executed checks and what was not measured |
++| `CHANGES.md` | This file |
++
++## Modified files
++
++| File | Change |
++| --- | --- |
++| `src/model/detr.py` | Select `resnet50` or `vit_b_32`; preserve the baseline state-dict layout; add width/position projections and parameter grouping API; prevent ViT reinitialization; report feature-grid size |
++| `src/model/__init__.py` | Export checkpoint helpers |
++| `src/__init__.py` | Export checkpoint helpers through the existing public package |
++| `src/trainer/trainer.py` | Generalize optimizer parameter groups; save configuration with weights; keep each experiment's outputs together |
++| `train.py` | Add model/weight/freeze/encoder-rate/output options; fix two-integer image-size parsing and integer max_tokens; validate configurations |
++| `src/visualize/visualizer.py` | Use height/width consistently and reshape attention using the actual encoder grid |
++| `requirements.txt` | Populate the previously empty dependency list |
++| `tests/test_detr.py` | Disable downloads in baseline tests |
++| `README.md` | Link the ViT guide; add model selection examples; correct the original example's output shape and token capacity |
++
++The dataset, transforms, loss, matching algorithm, and evaluator implementations
++are unchanged. The existing decoder implementation and detection-head structure
++are reused. Original trained ResNet weights can still be loaded with matching
++settings; the new encoder does not make full ResNet and ViT checkpoints
++interchangeable. Use the explicit decoder-transfer option for that experiment.
++
++## Behavior changes to account for
++
++- Training outputs now go to `runs/<model>/` by default, or `--output_dir`.
++- `--img_size` accepts `HEIGHT WIDTH`, such as `--img_size 640 640`.
++- `--max_tokens` is now parsed as an integer.
++- ViT ignores the baseline's `encoder_layers`, `encoder_heads` and `max_tokens`.
++- `n_classes` still includes the final no-object class; only its misleading
++  documentation was corrected.
++- Checkpoints include model/run configuration, but not optimizer/scheduler/RNG
++  state. `--weights` starts a new training run initialized from detector weights.
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,17 @@
+ # Detection Transformer (DETR)
++
++This version supports both the original **ResNet-50 DETR** and a **pretrained
++ViT-B/32 DETR** with direct image patches and no ResNet backbone. Start with
++[VIT_GUIDE.md](VIT_GUIDE.md) for installation, model selection, checkpoint
++compatibility, and the complete list of changes.
++
++```bash
++python train.py --model resnet50 --root ./voc --output_dir runs/resnet50
++python train.py --model vit_b_32 --root ./voc --img_size 640 640 --output_dir runs/vit_b32
++```
++
++The historical baseline results below describe only the original ResNet model;
++no detection accuracy results are claimed for the ViT variant.
+ 
+ PyTorch reimplementation of the Detection Transformer model described in the paper ["End-to-End Object Detection with Transformers"](https://arxiv.org/abs/2005.12872) from Carion et al., 2020.
+ 
+@@ -24,7 +37,7 @@
+ 
+ 
+ detr = DETR(
+-    n_classes=90 + 1,      # 90 classes + no-object class
++    n_classes=90 + 1,      # total outputs = 90 foreground + 1 no-object
+     num_queries=100,
+     d_model=256,
+     encoder_layers=6,
+@@ -33,12 +46,13 @@
+     decoder_heads=8,
+     ff_dim=2048,
+     dropout=0.1,
++    max_tokens=1050,       # ceil(800/32) * ceil(1333/32)
+ )
+ 
+ x = torch.randn(1, 3, 800, 1333)
+ logits, boxes = detr(x)
+ 
+-print(logits.shape)  # [1, 100, 92]
++print(logits.shape)  # [1, 100, 91]
+ print(boxes.shape)   # [1, 100, 4]
+ ```
+ 
+@@ -61,7 +75,7 @@
+ | Encoder layers | 6 | 6 |
+ | Decoder layers | 6 | 6 |
+ | Number of object queries | 100 | 25 |
+-| Number of classes | 91 (COCO) | 21 (+ 1 no-object) |
++| Number of classes | 91 (COCO) | 21 (20 foreground + 1 no-object) |
+ | Learning rate (transformer) | 1e-4 | 1e-4 |
+ | Learning rate (backbone) | 1e-5 | 1e-5 |
+ | Weight decay (transformer) | 1e-4 | 1e-4 |
+diff --git a/VALIDATION.md b/VALIDATION.md
+new file mode 100644
+--- /dev/null
++++ b/VALIDATION.md
+@@ -0,0 +1,65 @@
++# Validation performed
++
++Prepared on 2026-10-08 from the attached repository text.
++
++Test environment: Python 3.12, PyTorch 2.2.2+cpu, TorchVision 0.17.2+cpu,
++NumPy 1.26.4, TorchMetrics 1.3.2 and pytest 8.3.5. Tests used CPU with two
++OpenMP/MKL threads. OpenCV Headless 4.11.0.86 was used for imports in this
++non-GUI environment; the repository requirements retain regular OpenCV for
++the original webcam/video UI.
++
++## Passed
++
++19 distinct pytest cases passed across three targeted runs:
++
++| Run | Result |
++| --- | --- |
++| Offline suite | 17 passed; full-size integration test skipped |
++| `RUN_FULL_VIT_TESTS=1 python -m pytest -q -m integration` | Full-size ViT-B/32 test passed |
++| `RUN_PRETRAINED_VIT_TESTS=1 python -m pytest -q -m pretrained` | Authentic pretrained-weight test passed |
++
++The pretrained test was added after the offline suite ran. In the final test
++collection there are 19 cases; a default run opts out of the two expensive
++integration/pretrained cases. The runs above exercised all 19 cases.
++
++The checks cover:
++
++- Original DETR output shapes, normalized box range, finite values and gradients.
++- Actual TorchVision encoder blocks with rectangular and square inputs,
++  including 640 x 640 and 640 x 384.
++- Exact equivalence to TorchVision's encoder computation at its native 224 x 224
++  resolution, after removing CLS from the output.
++- Decoder auxiliary outputs and attention-map dimensions (no CLS in memory).
++- Hungarian matching and the existing detection loss with a nonempty target
++  image and an empty-target image in the same batch.
++- Nonzero finite gradients through patch projection, positional interpolation,
++  attention, new projections, queries, and detection heads.
++- An AdamW training step, correct parameter-group coverage/rates, and frozen
++  encoder behavior.
++- Saving/loading detector weights, reconstructing a model without downloading,
++  legacy raw-state-dict loading, and cross-architecture decoder transfer.
++- Rejection of incompatible decoder settings and invalid image dimensions.
++- The full 12-layer, 768-dimensional ViT-B/32: backward pass on 64 x 96 and
++  forward pass on 640 x 640.
++- The actual `ViT_B_32_Weights.IMAGENET1K_V1` checkpoint: every retained encoder
++  tensor equals an independently loaded TorchVision model after DETR
++  initialization; the pretrained detector gives finite outputs at 640 x 640.
++
++An additional direct comparison loaded the **original attached** implementation's
++state dict into the updated ResNet model with `strict=True`. Both class and box
++outputs were bit-identical on a 64 x 96 input in evaluation mode with matching
++settings. This comparison used the original source, not just another instance
++of the updated class.
++
++All Python source files passed syntax parsing. The CLI help was checked. The
++patch was applied to a fresh reconstruction of the attachment and compared to
++the delivered source tree before packaging.
++
++## Not measured
++
++No Pascal VOC training run, mAP comparison, CUDA throughput test, GPU memory
++benchmark, or interactive webcam test was performed. Dataset files and the
++user's trained checkpoint were not attached. Existing README accuracy results
++belong to the original ResNet experiment and do not establish ViT performance.
++The downloaded pretrained encoder weights and test checkpoints are not bundled;
++the code obtains official encoder weights through TorchVision when required.
+diff --git a/VIT_GUIDE.md b/VIT_GUIDE.md
+new file mode 100644
+--- /dev/null
++++ b/VIT_GUIDE.md
+@@ -0,0 +1,233 @@
++# Train ResNet DETR and ViT-B/32 DETR in one repository
++
++The default remains the repository's original ResNet-50 DETR. Select the new
++model with `--model vit_b_32`. It replaces **both** the ResNet feature backbone
++and the original DETR encoder with a pretrained TorchVision ViT-B/32. The same
++object queries, decoder, detection heads, Hungarian matching, auxiliary losses,
++VOC data pipeline, evaluator, and visualizer are used by both variants.
++
++## Install or apply the changes
++
++The complete `cypmd-detr/` folder in the download is reconstructed from the
++attached repository text with these changes applied. Dataset files, trained
++weights, and README image assets were not present in that text and are not
++included. You can use this folder as your training repository.
++
++If keeping your existing checkout, copy the files listed in `CHANGES.md` to the
++same relative paths. Alternatively, the bundle's `changes.patch` contains all
++additions and edits; from the root of your existing checkout run:
++
++```bash
++git apply --check /path/to/changes.patch
++git apply /path/to/changes.patch
++```
++
++Do not apply the patch to the already updated folder. If your checkout has
++additional edits, use the file list and diff to merge them instead of replacing
++your local work blindly.
++
++Use Python 3.10 or later. Keep/install a matching PyTorch and TorchVision pair
++for your hardware, following the [official installer](https://pytorch.org/get-started/locally/).
++Then, from the repository root:
++
++```bash
++python -m pip install -r requirements.txt
++```
++
++This implementation uses TorchVision directly; it does not require `timm` or
++Hugging Face Transformers. The first pretrained ViT run downloads the standard
++ImageNet-1K weights if they are not already in the PyTorch cache. A failed
++download raises an error; it never silently trains a random encoder.
++
++## Train either architecture
++
++Regular DETR, with the original architecture and defaults:
++
++```bash
++python train.py --model resnet50 --root ./voc \
++  --img_size 640 640 --num_queries 100 \
++  --output_dir runs/resnet50_experiment
++```
++
++Pretrained ViT-B/32 DETR (start with batch size 1 if GPU memory is limited):
++
++```bash
++python train.py --model vit_b_32 --root ./voc \
++  --img_size 640 640 --num_queries 100 --batch_size 1 \
++  --learning_rate 1e-4 --learning_rate_encoder 1e-5 \
++  --output_dir runs/vit_b32_experiment
++```
++
++Both commands assume VOC is already extracted at `./voc`. Add `--download` to
++request dataset downloading, as in the original repo. For a controlled
++comparison, set the same image size, query count, batch size, seed, decoder
++settings, augmentations, evaluation settings and training budget in both runs.
++The encoder architectures and pretraining differ, so this is not an equal
++parameter-count comparison. If your earlier run used 25 queries, use
++`--num_queries 25` in both commands.
++
++The learning rates above are starting settings, not tuned detection results.
++ViT-B/32 has greater encoder compute/memory requirements than this ResNet
++baseline. Lower the batch size or image size if needed. `--freeze_encoder`
++freezes the entire ViT (including its patch and position embeddings), leaving
++the projections and detection decoder trainable. In baseline mode it freezes
++the ResNet backbone. `--no_pretrained` enables a random-initialization ablation;
++omit it for pretrained training.
++
++## What the ViT model does
++
++For a normalized `640 x 640` RGB image:
++
++| Stage | Tensor shape |
++| --- | --- |
++| Input image | `[B, 3, 640, 640]` |
++| 32 x 32 patch projection | `[B, 400, 768]` |
++| Add CLS and learned spatial positions | `[B, 401, 768]` |
++| Pretrained ViT encoder: 12 layers, 12 attention heads | `[B, 401, 768]` |
++| Remove CLS, project encoder output to `d_model=256` | `[B, 400, 256]` |
++| Existing DETR decoder, with 100 object queries | `[B, 100, 256]` |
++| Class logits and normalized `cx, cy, w, h` boxes | `[B, 100, n_classes]`, `[B, 100, 4]` |
++
++The only convolution in the ViT encoder is its pretrained patch projection:
++`Conv2d(3, 768, kernel_size=32, stride=32)`. Mathematically this is a shared
++linear map on flattened, non-overlapping RGB patches, matching the supplied
++diagram. There is no ResNet, feature pyramid, or extra DETR encoder in this path.
++
++TorchVision's learned `7 x 7` patch-position grid is interpolated with bicubic
++interpolation to the current patch grid. The CLS position is preserved, CLS
++participates in pretrained self-attention, and only spatial patch tokens reach
++the detector. The ImageNet classification head is removed. A separate learned
++projection of the interpolated patch positions supplies positional information
++to the existing decoder's cross-attention keys. The original learned grid
++remains a trainable parameter, so interpolation also works at inference time.
++
++All pretrained patch-projection, attention, MLP, normalization, CLS, and position
++parameters are kept intact at construction. DETR initialization is restricted
++to new decoder/projection/detection layers. The encoder is fine-tuned by default.
++
++Use the existing detection transforms and ImageNet normalization. Do not replace
++them with the classification weights' center-crop transform: it would require
++corresponding box transformations. Normalization is applied by the data
++transforms, not again inside the model.
++
++## Configuration rules
++
++| Setting | ResNet-50 DETR | ViT-B/32 DETR |
++| --- | --- | --- |
++| `--model` | `resnet50` (default) | `vit_b_32` |
++| Encoder width/layers/heads | `d_model`, `encoder_layers`, `encoder_heads` | Fixed at 768 / 12 / 12 by pretrained ViT |
++| `--d_model`, `--decoder_layers`, `--decoder_heads`, `--ff_dim`, `--dropout` | As in the original model | Configure the DETR decoder and new projections; do not change ViT dimensions/dropout |
++| `--learning_rate` | Custom transformer and heads | New projections, queries, decoder and heads |
++| Feature encoder rate | `--learning_rate_backbone` | `--learning_rate_encoder` |
++| Feature encoder weight decay | `--weight_decay_backbone` | `--weight_decay_encoder` |
++| `--max_tokens` | Must cover `ceil(H/32) * ceil(W/32)` | Ignored; position grid is resized |
++| `--img_size` | Two integers, **height width** | Two integers, **height width**, each a multiple of 32 |
++| `--n_classes` | Total class outputs, including no-object | Same convention |
++
++For Pascal VOC, `--n_classes 21` means 20 foreground classes and no-object at
++index 20. Do not add another output class. Boxes stay normalized to `[0,1]` in
++`cxcywh` format, and `forward()` returns exactly `(logits, boxes)` as before.
++
++Rectangular inputs such as `--img_size 640 384` work. ViT rejects dimensions
++that are not multiples of 32 rather than dropping edge pixels. The current
++collate function stacks equally resized images; arbitrary ragged batches and
++padding masks are not introduced. A one-patch stride of 32 can limit spatial
++detail for small objects, so measure accuracy rather than assuming an improvement.
++
++## Use your already trained DETR
++
++Existing ResNet checkpoints retain the same state-dict keys and shapes. With the
++same architecture settings, loading your old raw `.pt` file remains supported:
++
++```python
++from src import DETR, load_weights
++
++model = DETR(
++    d_model=256, encoder_layers=6, encoder_heads=8,
++    decoder_layers=6, decoder_heads=8, n_classes=21,
++    num_queries=100, ff_dim=2048, dropout=0.1, max_tokens=400,
++    architecture="resnet50", pretrained=False,
++)
++load_weights(model, "old_resnet_weights.pt")
++```
++
++Match `num_queries` and all architecture settings to your actual old run.
++`pretrained=False` avoids an unnecessary ResNet download before loading the
++complete detector. The `pretrained` switch has no effect on the weights loaded
++from your checkpoint.
++
++To reuse the learned queries, decoder, class head and box head in the ViT model:
++
++```bash
++python train.py --model vit_b_32 --root ./voc \
++  --img_size 640 640 --num_queries 100 --batch_size 1 \
++  --init_decoder_from /path/to/old_resnet_weights.pt \
++  --output_dir runs/vit_b32_decoder_transfer
++```
++
++This keeps the new encoder's ImageNet-pretrained weights. Decoder layer count,
++width, head count, feed-forward width, query count, and class count must match
++the old model. Missing or shape-incompatible decoder weights produce an error.
++Legacy raw weights do not encode attention head count, so you must supply the
++original `--decoder_heads` value. Feature representations change when switching
++encoders; decoder transfer is an experiment, not a guarantee of faster convergence.
++For a fresh decoder comparison, omit `--init_decoder_from`.
++
++## Saved models and inference
++
++Each output directory contains:
++
++| File | Contents |
++| --- | --- |
++| `checkpoint.pt` | Model weights, model configuration, run arguments and epoch |
++| `model_weights.pt` | Raw state dict for existing inference notebooks |
++| `model_config.json` | Constructor arguments |
++| `train_metrics.csv`, `val_metrics.csv` | Original metrics (`val` only if used) |
++
++These are model checkpoints, not complete optimizer/RNG-resume snapshots. Using
++`--weights path/to/checkpoint.pt` or `--weights path/to/model_weights.pt` loads
++the entire detector strictly and starts a **new** optimizer/schedule. Set the
++matching model/configuration flags. Use a separate `--output_dir` for each
++experiment; another run in the same directory replaces these files.
++
++New self-describing checkpoints can be loaded for inference without a download:
++
++```python
++from src import load_model, DETRVisualizer
++
++model = load_model("runs/vit_b32_experiment/checkpoint.pt", device="cuda")
++visualizer = DETRVisualizer(model, img_size=(640, 640), device="cuda")
++# Use the existing visualizer methods as before.
++```
++
++When calling the model directly, supply RGB float tensors normalized by the
++existing transforms, use `model.eval()` and `torch.no_grad()`, and use the same
++image preprocessing as during training. Decoder attention maps use the actual
++patch grid and support rectangular images.
++
++## Checks
++
++```bash
++python -m pip install -r requirements-dev.txt
++python -m pytest -q
++RUN_FULL_VIT_TESTS=1 python -m pytest -q
++# Optional: also check authentic pretrained weights (downloads if uncached).
++RUN_PRETRAINED_VIT_TESTS=1 python -m pytest -q -m pretrained
++```
++
++Normal tests require no downloads. Most new tests use real TorchVision encoder
++blocks at reduced width to keep them fast. The opt-in integration test constructs
++the actual 12-layer, 768-dimensional ViT-B/32 with random weights, checks
++backpropagation, and tests a 640 x 640 forward pass. The separate pretrained
++check compares every retained encoder tensor against the official checkpoint.
++`VALIDATION.md` records what
++was executed when this bundle was prepared. Model accuracy still requires a
++training/evaluation run on your dataset.
++
++## Upstream references
++
++- [TorchVision ViT-B/32 and pretrained normalization](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.vit_b_32.html)
++- [TorchVision ViT source and positional interpolation](https://docs.pytorch.org/vision/stable/_modules/torchvision/models/vision_transformer.html)
++
++These references describe the upstream encoder. The patch-token adapter,
++decoder projections and repository integration are implemented in this bundle.
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,5 @@
++[pytest]
++testpaths = tests
++markers =
++    integration: full-size ViT architecture check (set RUN_FULL_VIT_TESTS=1)
++    pretrained: downloads official ImageNet weights (set RUN_PRETRAINED_VIT_TESTS=1)
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,2 @@
++-r requirements.txt
++pytest>=7.4
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -0,0 +1,14 @@
++# Python >= 3.10. Install a matching torch/torchvision pair for your CUDA version
++# first (https://pytorch.org/get-started/locally/), then install this file.
++torch>=2.2
++torchvision>=0.17
++numpy>=1.23,<2
++scipy>=1.10
++pandas>=2.0
++Pillow>=9.5
++tqdm>=4.65
++torchmetrics>=1.3,<2
++pycocotools>=2.0.7
++matplotlib>=3.7
++seaborn>=0.13
++opencv-python>=4.8,<4.12
+diff --git a/src/__init__.py b/src/__init__.py
+--- a/src/__init__.py
++++ b/src/__init__.py
+@@ -1,4 +1,4 @@
+-from src.model import DETR, DETRLoss
++from src.model import DETR, DETRLoss, load_model, load_weights, load_decoder_weights
+ from src.trainer import DETRTrainer, DETREvaluator
+ from src.visualize.visualizer import DETRVisualizer
+ from src.visualize.inference import extract_boxes, extract_boxes_with_attn
+diff --git a/src/model/__init__.py b/src/model/__init__.py
+--- a/src/model/__init__.py
++++ b/src/model/__init__.py
+@@ -1,2 +1,3 @@
+ from src.model.detr import DETR
+ from src.model.loss import DETRLoss
++from src.model.checkpoint import load_model, load_weights, load_decoder_weights
+diff --git a/src/model/checkpoint.py b/src/model/checkpoint.py
+new file mode 100644
+--- /dev/null
++++ b/src/model/checkpoint.py
+@@ -0,0 +1,74 @@
++"""Load self-describing checkpoints or explicitly configured legacy weights."""
++
++from collections.abc import Mapping
++
++import torch
++
++from src.model.detr import DETR
++
++
++def read_checkpoint(path):
++    # Only tensor/primitive checkpoints from this repository are supported.
++    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
++    if not isinstance(checkpoint, Mapping):
++        raise ValueError("Expected a state dict or a checkpoint mapping")
++    state = checkpoint.get("model_state_dict", checkpoint)
++    if not isinstance(state, Mapping) or not state:
++        raise ValueError("Checkpoint contains no model weights")
++    if not all(isinstance(key, str) and torch.is_tensor(value) for key, value in state.items()):
++        raise ValueError("Expected a raw state dict or the model_state_dict checkpoint key")
++    return checkpoint, state
++
++
++def load_weights(model: DETR, path) -> None:
++    """Strictly load complete detection weights; never silently skip layers."""
++    checkpoint, state = read_checkpoint(path)
++    config = checkpoint.get("model_config")
++    if config and config["architecture"] != model.architecture:
++        raise ValueError("Checkpoint architecture differs; use --init_decoder_from to transfer the decoder")
++    if config:
++        fields = ["d_model", "decoder_layers", "decoder_heads", "ff_dim", "num_queries", "n_classes"]
++        if model.architecture == "resnet50":
++            fields += ["encoder_layers", "encoder_heads", "max_tokens"]
++        mismatches = [key for key in fields if config[key] != model.model_config[key]]
++        if mismatches:
++            raise ValueError(f"Model configuration differs: {', '.join(mismatches)}")
++    model.load_state_dict(state, strict=True)
++
++
++def load_decoder_weights(model: DETR, path) -> None:
++    """Warm-start the compatible queries, decoder and detection heads only.
++
++    Requires matching d_model, decoder layers/heads, ff_dim, queries and classes.
++    A legacy raw state dict cannot verify attention head count; supply the same
++    decoder_heads setting used to train it.
++    """
++    checkpoint, state = read_checkpoint(path)
++    config = checkpoint.get("model_config")
++    if config:
++        fields = ("d_model", "decoder_layers", "decoder_heads", "ff_dim", "num_queries", "n_classes")
++        mismatches = [key for key in fields if config[key] != model.model_config[key]]
++        if mismatches:
++            raise ValueError(f"Decoder configuration differs: {', '.join(mismatches)}")
++    prefixes = ("transformer.decoder.", "queries.", "proj_class.", "proj_bbox.")
++    expected = {key: value for key, value in model.state_dict().items() if key.startswith(prefixes)}
++    incoming = {key: value for key, value in state.items() if key.startswith(prefixes)}
++    if incoming.keys() != expected.keys():
++        raise ValueError("Decoder checkpoint keys differ; match decoder_layers and model settings")
++    bad_shapes = [key for key in expected if expected[key].shape != incoming[key].shape]
++    if bad_shapes:
++        raise ValueError(f"Decoder checkpoint shapes differ: {', '.join(bad_shapes)}")
++    # Other keys are deliberately absent: the new encoder retains ViT weights.
++    model.load_state_dict(incoming, strict=False)
++
++
++def load_model(path, device="cpu") -> DETR:
++    """Reconstruct a saved model without downloading pretrained weights."""
++    checkpoint, state = read_checkpoint(path)
++    if "model_config" not in checkpoint:
++        raise ValueError("Legacy raw weights require DETR(..., pretrained=False) and load_weights(model, path)")
++    config = dict(checkpoint["model_config"])
++    config["pretrained"] = False
++    model = DETR(**config)
++    model.load_state_dict(state, strict=True)
++    return model.to(device).eval()
+diff --git a/src/model/detr.py b/src/model/detr.py
+--- a/src/model/detr.py
++++ b/src/model/detr.py
+@@ -4,7 +4,9 @@
+ import torch
+ import torch.nn as nn
+ 
+-from torchvision.models import resnet101, ResNet101_Weights, resnet50, ResNet50_Weights
++from torchvision.models import resnet50, ResNet50_Weights
++
++from src.model.vit import ViTPatchEncoder
+ 
+ 
+ class ResNet50Backbone(nn.Module):
+@@ -16,10 +18,11 @@
+     Deep Residual Learning for Image Recognition, He et al., 2015
+     https://arxiv.org/abs/1512.03385
+     """ 
+-    def __init__(self) -> None:
+-        super().__init__()
+-
+-        resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
++    def __init__(self, pretrained: bool = True) -> None:
++        super().__init__()
++
++        weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
++        resnet = resnet50(weights=weights)
+ 
+         # [N, 3, H_0, W_0] -> [N, 2048, H, W]
+         self.resnet50 = nn.Sequential(
+@@ -82,6 +85,12 @@
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         # Input image x has shape:                          # [B, W * H, d_model]
+         B, L, d_model = x.shape
++
++        if L > self.pos.shape[1]:
++            raise ValueError(
++                f"ResNet produced {L} tokens, but max_tokens={self.pos.shape[1]}. "
++                "Increase --max_tokens or reduce --img_size."
++            )
+ 
+         pos = self.pos[:, :L, :].expand(B, L, d_model)      # [B, W * H, d_model]
+ 
+@@ -300,6 +309,27 @@
+         x_enc = self.encoder(x_enc, pos_enc)
+         x_dec = self.decoder(x_enc, x_dec, pos_enc, queries)
+         return x_dec
++
++
++class ViTTransformer(nn.Module):
++    """Pretrained image encoder followed by the repository's DETR decoder."""
++
++    def __init__(
++            self, decoder_layers: int, decoder_heads: int, d_model: int,
++            ff_dim: int, dropout: float, pretrained: bool, freeze_encoder: bool,
++    ) -> None:
++        super().__init__()
++        self.encoder = ViTPatchEncoder(pretrained=pretrained, frozen=freeze_encoder)
++        self.input_proj = nn.Linear(self.encoder.hidden_dim, d_model)
++        self.position_proj = nn.Linear(self.encoder.hidden_dim, d_model, bias=False)
++        self.decoder = Decoder(decoder_layers, decoder_heads, d_model, ff_dim, dropout)
++
++    def forward(self, images: torch.Tensor, queries: Queries) -> torch.Tensor:
++        memory, positions = self.encoder(images)
++        memory = self.input_proj(memory)
++        positions = self.position_proj(positions)
++        query = queries(memory)
++        return self.decoder(memory, torch.zeros_like(query), positions, query)
+ 
+ 
+ class DETR(nn.Module):
+@@ -323,12 +353,20 @@
+             ff_dim: int=2048,
+             dropout: float=0.1,
+             max_tokens: int=400,
++            *,
++            architecture: str="resnet50",
++            pretrained: bool=True,
++            freeze_encoder: bool=False,
+     ) -> None:
+         """
+         Detection Transformer
+ 
+-        NOTE: Expected foreground classes are 0, ..., n_classes - 1,
+-        with an empty_set_class_id = n_classes. 
++        n_classes INCLUDES no-object: foreground IDs are 0..n_classes-2,
++        and the no-object ID is n_classes-1 (VOC: 21 outputs).
++
++        architecture="resnet50" preserves the original parameter names.
++        architecture="vit_b_32" replaces both ResNet and the DETR encoder.
++        encoder_layers, encoder_heads and max_tokens apply only to ResNet.
+         
+         Reference:
+         ---------- 
+@@ -336,22 +374,45 @@
+         https://arxiv.org/abs/2005.12872 
+         """ 
+         super().__init__()
++        if architecture not in {"resnet50", "vit_b_32"}:
++            raise ValueError(f"Unknown architecture: {architecture}")
++        if d_model <= 0 or decoder_heads <= 0 or d_model % decoder_heads:
++            raise ValueError("d_model must be positive and divisible by decoder_heads")
++        if decoder_layers < 1 or n_classes < 2 or num_queries < 1:
++            raise ValueError("Need decoder_layers >= 1, n_classes >= 2 and num_queries >= 1")
++        if architecture == "resnet50":
++            if encoder_layers < 1 or encoder_heads <= 0 or d_model % encoder_heads:
++                raise ValueError("Need encoder_layers >= 1 and d_model divisible by encoder_heads")
++            if not isinstance(max_tokens, int) or max_tokens < 1:
++                raise ValueError("max_tokens must be a positive integer")
++
++        self.architecture = architecture
+         self.n_classes = n_classes
+         self.num_queries = num_queries
+-
+-        # [B, 3, W_0, H_0] -> [B, 2048, W, H]        
+-        self.backbone = ResNet50Backbone()
+-
+-        # [B, 2048, W, H] -> [B, W * H, d_model] (now a sequence suitable for transformers)
+-        self.spatial_to_sequence = SpatialToSequence(2048, d_model)
+-
+-        # [B, d_model, W * H] -> [B, num_queries, d_model]
+-        self.transformer = Transformer(
+-            encoder_layers, encoder_heads, decoder_layers, decoder_heads, d_model, ff_dim, dropout
+-        )
+-
+-        # [B, W * H, d_model] -> [B, W * H, d_model]
+-        self.pos_enc = PositionalEncoding(max_tokens, d_model)
++        self.feature_grid_size = None
++        self.model_config = dict(
++            d_model=d_model, encoder_layers=encoder_layers, encoder_heads=encoder_heads,
++            decoder_layers=decoder_layers, decoder_heads=decoder_heads,
++            n_classes=n_classes, num_queries=num_queries, ff_dim=ff_dim,
++            dropout=dropout, max_tokens=max_tokens, architecture=architecture,
++            pretrained=pretrained, freeze_encoder=freeze_encoder,
++        )
++
++        if architecture == "resnet50":
++            self.backbone = ResNet50Backbone(pretrained=pretrained)
++            self.spatial_to_sequence = SpatialToSequence(2048, d_model)
++            self.transformer = Transformer(
++                encoder_layers, encoder_heads, decoder_layers, decoder_heads,
++                d_model, ff_dim, dropout,
++            )
++            self.pos_enc = PositionalEncoding(max_tokens, d_model)
++            if freeze_encoder:
++                self.backbone.requires_grad_(False)
++        else:
++            self.transformer = ViTTransformer(
++                decoder_layers, decoder_heads, d_model, ff_dim, dropout,
++                pretrained=pretrained, freeze_encoder=freeze_encoder,
++            )
+ 
+         # [] -> [B, num_queries, d_model] 
+         self.queries = Queries(num_queries, d_model) 
+@@ -376,30 +437,40 @@
+         self._init_params()
+ 
+     def forward(self, x_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+-        # Input image x_img has shape:                  # [B, 3, H_0, W_0]
+-        x_feat = self.backbone(x_img)                   # [B, 2048, H, W]
+-
+-        x_feat = self.spatial_to_sequence(x_feat)       # [B, H * W, d_model]
+-        
+-        pos_enc = self.pos_enc(x_feat)                  # [B, H * W, d_model]
+-        queries = self.queries(x_feat)                  # [B, num_queries, d_model]
+-        x_dec = torch.zeros_like(queries)               # [B, num_queries, d_model]
+-
+-        x_tr = self.transformer(
+-            x_feat, x_dec, pos_enc, queries
+-        )                                               # [B, num_queries, d_model]
++        if self.architecture == "resnet50":
++            x_feat = self.backbone(x_img)
++            self.feature_grid_size = tuple(x_feat.shape[-2:])
++            x_feat = self.spatial_to_sequence(x_feat)
++            pos_enc = self.pos_enc(x_feat)
++            queries = self.queries(x_feat)
++            x_tr = self.transformer(x_feat, torch.zeros_like(queries), pos_enc, queries)
++        else:
++            x_tr = self.transformer(x_img, self.queries)
++            self.feature_grid_size = (x_img.shape[-2] // 32, x_img.shape[-1] // 32)
+ 
+         x_logits = self.proj_class(x_tr)                # [B, num_queries, n_classes]
+         x_bbox = self.proj_bbox(x_tr)                   # [B, num_queries, 4]
+         return x_logits, x_bbox
++
++    def pretrained_parameters(self):
++        """Parameters assigned the smaller feature-encoder learning rate."""
++        if self.architecture == "resnet50":
++            return self.backbone.parameters()
++        return self.transformer.encoder.parameters()
+     
+     def _init_params(self) -> None:
+-        modules = chain(
+-            self.transformer.modules(),
+-            self.proj_bbox.modules(),
+-            self.proj_class.modules(),
+-            self.spatial_to_sequence.modules() 
+-        ) 
++        if self.architecture == "resnet50":
++            modules = chain(
++                self.transformer.modules(), self.proj_bbox.modules(),
++                self.proj_class.modules(), self.spatial_to_sequence.modules(),
++            )
++        else:
++            # Do not walk transformer.modules(): that would overwrite pretrained ViT!
++            modules = chain(
++                self.transformer.decoder.modules(), self.transformer.input_proj.modules(),
++                self.transformer.position_proj.modules(), self.proj_bbox.modules(),
++                self.proj_class.modules(),
++            )
+         for m in modules:
+             if isinstance(m, nn.Linear): 
+                 nn.init.xavier_uniform_(m.weight)
+diff --git a/src/model/vit.py b/src/model/vit.py
+new file mode 100644
+--- /dev/null
++++ b/src/model/vit.py
+@@ -0,0 +1,83 @@
++"""TorchVision ViT-B/32 adapted to return spatial tokens for detection."""
++
++import math
++from typing import Tuple
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++from torchvision.models import ViT_B_32_Weights, vit_b_32
++
++
++class ViTPatchEncoder(nn.Module):
++    """Encode RGB patches without a CNN feature backbone or classification head.
++
++    Images must be normalized with the existing ImageNet mean/std and have
++    positive height/width divisible by 32. Rectangular images are supported.
++    Keep CLS inside the pretrained encoder, then remove it from decoder memory.
++    """
++
++    patch_size = 32
++
++    def __init__(self, pretrained: bool = True, frozen: bool = False) -> None:
++        super().__init__()
++        weights = ViT_B_32_Weights.IMAGENET1K_V1 if pretrained else None
++        self.vit = vit_b_32(weights=weights)
++        self.vit.heads = nn.Identity()
++        self.hidden_dim = self.vit.hidden_dim
++        self.frozen = frozen
++        if frozen:
++            self.vit.requires_grad_(False)
++            self.vit.eval()
++
++    def train(self, mode: bool = True):
++        super().train(mode)
++        if self.frozen:
++            self.vit.eval()
++        return self
++
++    def spatial_positions(self, height: int, width: int) -> torch.Tensor:
++        """Interpolate the learned 7x7 patch grid; preserve the CLS position.
++
++        Keep the original Parameter so gradients and saved weights retain their
++        normal form. Recompute for each input grid, without changing checkpoints.
++        """
++        position = self.vit.encoder.pos_embedding
++        cls_position, patch_positions = position[:, :1], position[:, 1:]
++        side = math.isqrt(patch_positions.shape[1])
++        if side * side != patch_positions.shape[1]:
++            raise ValueError("Expected a square pretrained ViT positional grid")
++        if (height, width) == (side, side):
++            return position
++
++        grid = patch_positions.reshape(1, side, side, self.hidden_dim).permute(0, 3, 1, 2)
++        # Float interpolation also works when the model has been cast to fp16.
++        grid = F.interpolate(
++            grid.float(), size=(height, width), mode="bicubic", align_corners=True,
++        ).to(position.dtype)
++        grid = grid.flatten(2).transpose(1, 2)
++        return torch.cat((cls_position, grid), dim=1)
++
++    def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        if images.ndim != 4 or images.shape[1] != 3:
++            raise ValueError("ViT expects normalized RGB images with shape [B, 3, H, W]")
++        height, width = images.shape[-2:]
++        if height < 32 or width < 32 or height % 32 or width % 32:
++            raise ValueError(
++                f"ViT-B/32 requires H and W to be positive multiples of 32; got {height}x{width}. "
++                "Set --img_size HEIGHT WIDTH, for example --img_size 640 640."
++            )
++
++        # Conv2d(kernel_size=stride=32) is exactly a shared linear projection
++        # of non-overlapping flattened patches, not a CNN feature backbone.
++        patches = self.vit.conv_proj(images).flatten(2).transpose(1, 2)
++        cls = self.vit.class_token.expand(images.shape[0], -1, -1).to(patches.dtype)
++        tokens = torch.cat((cls, patches), dim=1)
++        positions = self.spatial_positions(height // 32, width // 32).to(tokens.dtype)
++
++        # Equivalent to TorchVision's encoder forward with resized positions.
++        # Avoid its classifier forward, which asserts the native 224x224 size.
++        tokens = self.vit.encoder.dropout(tokens + positions)
++        tokens = self.vit.encoder.layers(tokens)
++        tokens = self.vit.encoder.ln(tokens)
++        return tokens[:, 1:], positions[:, 1:].expand(images.shape[0], -1, -1)
+diff --git a/src/trainer/trainer.py b/src/trainer/trainer.py
+--- a/src/trainer/trainer.py
++++ b/src/trainer/trainer.py
+@@ -1,6 +1,7 @@
+ from typing import Dict
+ 
+ import os
++import json
+ 
+ import pandas as pd
+ from tqdm.auto import tqdm
+@@ -32,7 +33,11 @@
+             decay_lr_every: int=50,
+             eval_every: int=5,
+             save_every: int=5,
+-            verbose: bool=True
++            verbose: bool=True,
++            learning_rate_encoder: float|None=None,
++            weight_decay_encoder: float|None=None,
++            output_dir: str|None=None,
++            run_config: Dict|None=None,
+     ) -> None:
+         # Detect device 
+         self.device = torch.device(device)
+@@ -41,24 +46,32 @@
+         self.detr = detr
+         self.detr.to(self.device)
+ 
+-        backbone_params = set(id(p) for p in self.detr.backbone.parameters())
+-
+-        # Optimizer for transformer and backbone
+-        self.optimizer = torch.optim.AdamW([
++        encoder_parameters = list(self.detr.pretrained_parameters())
++        encoder_ids = {id(p) for p in encoder_parameters}
++        encoder_lr = learning_rate_backbone
++        encoder_wd = weight_decay_backbone
++        if self.detr.architecture == "vit_b_32":
++            encoder_lr = learning_rate_encoder if learning_rate_encoder is not None else 1e-5
++            encoder_wd = weight_decay_encoder if weight_decay_encoder is not None else weight_decay_backbone
++
++        # The pretrained feature encoder gets its own learning rate. Decoder,
++        # new projections, queries and heads use the main learning rate.
++        groups = [
+             {
+-                "params": [p for p in self.detr.backbone.parameters() if p.requires_grad],
+-                "lr": learning_rate_backbone,
+-                "weight_decay": weight_decay_backbone,
++                "params": [p for p in encoder_parameters if p.requires_grad],
++                "lr": encoder_lr,
++                "weight_decay": encoder_wd,
+             },
+             {
+                 "params": [
+                     p for p in self.detr.parameters()
+-                    if p.requires_grad and id(p) not in backbone_params
++                    if p.requires_grad and id(p) not in encoder_ids
+                 ],
+                 "lr": learning_rate,
+                 "weight_decay": weight_decay,
+             },
+-        ])
++        ]
++        self.optimizer = torch.optim.AdamW([group for group in groups if group["params"]])
+ 
+         # DETR loss
+         self.criterion = DETRLoss(lambda_l1, lambda_giou, detr.n_classes)
+@@ -84,6 +97,9 @@
+         self.save_every = save_every
+         self.verbose = verbose
+         self.has_val = False
++        self.output_dir = output_dir or os.path.join("runs", detr.architecture)
++        self.run_config = dict(run_config or {})
++        self.epoch = 0
+ 
+         self.evaluator = DETREvaluator(
+             self.detr, self.criterion, self.device, self.score_tresh
+@@ -104,6 +120,7 @@
+     def train(self, train_loader: DataLoader, val_loader: DataLoader|None=None) -> None:
+         if val_loader is not None: self.has_val = True 
+         for epoch in range(1, self.n_epochs + 1): 
++            self.epoch = epoch
+             
+             self.train_one_epoch(train_loader, epoch=epoch)
+ 
+@@ -198,22 +215,26 @@
+         if self.verbose:
+             tqdm.write("Saving checkpoint and metric reports...")
+ 
+-        lr = self.learning_rate 
+-        wd = self.weight_decay
+-        n_params = self.n_params
+-
+-        save_dir = f"DETR-checkpoints"
++        save_dir = self.output_dir
+         os.makedirs(save_dir, exist_ok=True)
+-
+-        file_name = (f"DETR-Lr{lr}-WeightDecay{wd}-Params{n_params}.pt")
+-        file_path = os.path.join(save_dir, file_name) 
+-        torch.save(self.detr.state_dict(), file_path)
++        file_path = os.path.join(save_dir, "checkpoint.pt")
++        torch.save({
++            "format_version": 1,
++            "epoch": self.epoch,
++            "model_config": self.detr.model_config,
++            "run_config": self.run_config,
++            "model_state_dict": self.detr.state_dict(),
++        }, file_path)
++        # Retain a raw state dict for existing inference notebooks.
++        torch.save(self.detr.state_dict(), os.path.join(save_dir, "model_weights.pt"))
++        with open(os.path.join(save_dir, "model_config.json"), "w") as handle:
++            json.dump(self.detr.model_config, handle, indent=2)
+         
+-        file_name = f"DETR-Report-Train-Lr{lr}-WeightDecay{wd}-Params{n_params}.csv"
++        file_name = os.path.join(save_dir, "train_metrics.csv")
+         pd.DataFrame.from_dict(self.stats_train).to_csv(file_name, index=False)
+ 
+         if self.has_val: 
+-            file_name = f"DETR-Report-Val-Lr{lr}-WeightDecay{wd}-Params{n_params}.csv"
++            file_name = os.path.join(save_dir, "val_metrics.csv")
+             pd.DataFrame.from_dict(self.stats_val).to_csv(file_name, index=False)
+ 
+         if self.verbose:
+diff --git a/src/visualize/visualizer.py b/src/visualize/visualizer.py
+--- a/src/visualize/visualizer.py
++++ b/src/visualize/visualizer.py
+@@ -46,8 +46,8 @@
+         # Prepare DETR for attention map visualization 
+         for decoder in self.detr.transformer.decoder.layers:
+             decoder.save_attention_weight_ = True
+-        img_w, img_h = img_size     # Pillow width and height style
+-        self.attention_size = (img_h // 32, img_w // 32)
++        img_h, img_w = img_size     # Same (height, width) convention as v2.Resize.
++        self.attention_size = ((img_h + 31) // 32, (img_w + 31) // 32)
+ 
+         # Pillow image to torch.Tensor transform
+         self.transform = ValidationTransform(img_size)
+@@ -209,6 +209,8 @@
+         # DETR inference
+         logits, boxes_pred = self.detr(img_tensor)
+         
++        # Use the actual encoder grid, including rectangular inputs.
++        self.attention_size = self.detr.feature_grid_size
+         # Cache attention weights
+         attention_weights = self.detr.transformer.decoder.attention_weights_
+         attention_weights = torch.stack(attention_weights).mean(0).squeeze(0)     # [num_queries, H * W]
+diff --git a/tests/test_detr.py b/tests/test_detr.py
+--- a/tests/test_detr.py
++++ b/tests/test_detr.py
+@@ -22,6 +22,7 @@
+         num_queries=100,
+         ff_dim=2048,
+         dropout=0.1,
++        pretrained=False,  # Unit tests must not download ResNet weights.
+     ).to(device)
+     return model
+ 
+diff --git a/tests/test_vit_detr.py b/tests/test_vit_detr.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_vit_detr.py
+@@ -0,0 +1,234 @@
++"""Offline checks with real TorchVision blocks; no downloaded weights/dataset.
++
++Most tests use a reduced-width ViT to exercise the exact adapter cheaply.
++RUN_FULL_VIT_TESTS=1 also tests the unmodified ViT-B/32 architecture.
++"""
++
++import os
++
++import pytest
++import torch
++from torch import nn
++from torchvision.models.vision_transformer import VisionTransformer
++
++from src import DETR, DETRLoss, DETRTrainer, load_model, load_weights, load_decoder_weights
++import src.model.vit as vit_module
++from train import parse_args
++
++
++def settings(**overrides):
++    config = dict(
++        d_model=32, encoder_layers=1, encoder_heads=4, decoder_layers=2,
++        decoder_heads=4, n_classes=4, num_queries=5, ff_dim=64,
++        dropout=0.0, max_tokens=400, architecture="vit_b_32", pretrained=False,
++    )
++    config.update(overrides)
++    return config
++
++
++@pytest.fixture
++def tiny_vit(monkeypatch):
++    created = []
++
++    def build(*, weights):
++        vit = VisionTransformer(
++            image_size=224, patch_size=32, num_layers=2, num_heads=4,
++            hidden_dim=32, mlp_dim=64, dropout=0.0, attention_dropout=0.0,
++        )
++        # Record values BEFORE DETR initialization to detect accidental reinit.
++        reference = {k: v.clone() for k, v in vit.state_dict().items() if not k.startswith("heads.")}
++        created.append((weights, reference))
++        return vit
++
++    monkeypatch.setattr(vit_module, "vit_b_32", build)
++    return created
++
++
++def targets():
++    return [
++        {"boxes": torch.tensor([[0.4, 0.5, 0.2, 0.3]]), "labels": torch.tensor([1])},
++        {"boxes": torch.empty(0, 4), "labels": torch.empty(0, dtype=torch.long)},
++    ]
++
++
++def trainer_for(model, tmp_path):
++    return DETRTrainer(
++        model, n_epochs=1, learning_rate=1e-4, learning_rate_backbone=5e-5,
++        weight_decay=1e-4, weight_decay_backbone=1e-4, lr_schedule=0.1,
++        lambda_l1=5.0, lambda_giou=2.0, device="cpu", verbose=False,
++        learning_rate_encoder=1e-5, output_dir=str(tmp_path),
++    )
++
++
++def test_pretrained_encoder_is_never_reinitialized(tiny_vit):
++    model = DETR(**settings(pretrained=True))
++    requested, before = tiny_vit[0]
++    assert requested == vit_module.ViT_B_32_Weights.IMAGENET1K_V1
++    after = model.transformer.encoder.vit.state_dict()
++    assert before.keys() == after.keys()
++    assert all(torch.equal(before[key], after[key]) for key in before)
++    assert not hasattr(model, "backbone")
++    assert not hasattr(model, "spatial_to_sequence")
++    assert isinstance(model.transformer.encoder.vit.heads, nn.Identity)
++
++
++def test_native_resolution_matches_torchvision_encoder(tiny_vit):
++    model = DETR(**settings()).eval()
++    encoder = model.transformer.encoder
++    image = torch.randn(1, 3, 224, 224)
++    with torch.no_grad():
++        actual, positions = encoder(image)
++        patches = encoder.vit.conv_proj(image).flatten(2).transpose(1, 2)
++        tokens = torch.cat((encoder.vit.class_token, patches), dim=1)
++        expected = encoder.vit.encoder(tokens)[:, 1:]
++    torch.testing.assert_close(actual, expected)
++    torch.testing.assert_close(positions, encoder.vit.encoder.pos_embedding[:, 1:])
++
++
++@pytest.mark.parametrize("height,width", [(64, 96), (224, 224), (640, 640), (640, 384)])
++def test_patch_shapes_attention_and_outputs(tiny_vit, height, width):
++    model = DETR(**settings()).eval()
++    for layer in model.transformer.decoder.layers:
++        layer.save_attention_weight_ = True
++    with torch.no_grad():
++        logits, boxes = model(torch.randn(1, 3, height, width))
++    assert logits.shape == (1, 5, 4)
++    assert boxes.shape == (1, 5, 4)
++    assert torch.isfinite(logits).all() and torch.isfinite(boxes).all()
++    assert ((boxes >= 0) & (boxes <= 1)).all()
++    assert model.feature_grid_size == (height // 32, width // 32)
++    expected_tokens = (height // 32) * (width // 32)
++    assert all(w.shape == (1, 5, expected_tokens) for w in model.transformer.decoder.attention_weights_)
++    assert len(model.transformer.decoder.outs_) == 2
++
++
++def test_real_detection_loss_backward_and_auxiliary_outputs(tiny_vit):
++    model = DETR(**settings())
++    logits, boxes = model(torch.randn(2, 3, 64, 96))
++    criterion = DETRLoss(5.0, 2.0, 4)
++    loss = criterion(logits, boxes, targets())[0]
++    for intermediate in model.transformer.decoder.outs_[:-1]:
++        loss = loss + criterion(model.proj_class(intermediate), model.proj_bbox(intermediate), targets())[0]
++    assert torch.isfinite(loss)
++    loss.backward()
++    parameters = [
++        model.transformer.encoder.vit.conv_proj.weight,
++        model.transformer.encoder.vit.encoder.pos_embedding,
++        model.transformer.encoder.vit.encoder.layers[0].self_attention.in_proj_weight,
++        model.transformer.input_proj.weight, model.transformer.position_proj.weight,
++        model.queries.queries, model.proj_class.weight, model.proj_bbox[0].weight,
++    ]
++    assert all(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0 for p in parameters)
++
++
++@pytest.mark.parametrize("frozen", [False, True])
++def test_training_step_optimizer_groups_and_freezing(tiny_vit, tmp_path, frozen):
++    model = DETR(**settings(freeze_encoder=frozen))
++    trainer = trainer_for(model, tmp_path)
++    groups = trainer.optimizer.param_groups
++    optimizer_ids = [id(p) for group in groups for p in group["params"]]
++    assert len(optimizer_ids) == len(set(optimizer_ids))
++    assert set(optimizer_ids) == {id(p) for p in model.parameters() if p.requires_grad}
++    if frozen:
++        assert len(groups) == 1
++    else:
++        assert groups[0]["lr"] == 1e-5 and groups[1]["lr"] == 1e-4
++        assert {id(p) for p in groups[0]["params"]} == {id(p) for p in model.pretrained_parameters()}
++    encoder_before = model.transformer.encoder.vit.conv_proj.weight.detach().clone()
++    decoder_before = model.proj_class.weight.detach().clone()
++    trainer.train_one_epoch([(torch.randn(2, 3, 64, 96), targets())], epoch=1)
++    assert not torch.equal(decoder_before, model.proj_class.weight)
++    if frozen:
++        assert not model.transformer.encoder.vit.training
++        assert all(p.grad is None and not p.requires_grad for p in model.pretrained_parameters())
++        assert torch.equal(encoder_before, model.transformer.encoder.vit.conv_proj.weight)
++    else:
++        assert not torch.equal(encoder_before, model.transformer.encoder.vit.conv_proj.weight)
++
++
++def test_checkpoint_round_trip_and_decoder_transfer(tiny_vit, tmp_path):
++    model = DETR(**settings()).eval()
++    trainer = trainer_for(model, tmp_path)
++    trainer._checkpoint()
++    restored = load_model(tmp_path / "checkpoint.pt")
++    assert tiny_vit[-1][0] is None  # Loading does not download pretraining weights.
++    image = torch.randn(1, 3, 64, 96)
++    with torch.no_grad():
++        before, after = model(image), restored(image)
++    for expected, actual in zip(before, after):
++        torch.testing.assert_close(expected, actual)
++    load_weights(restored, tmp_path / "model_weights.pt")
++    destination = DETR(**settings())
++    encoder_before = destination.transformer.encoder.vit.conv_proj.weight.detach().clone()
++    load_decoder_weights(destination, tmp_path / "checkpoint.pt")
++    torch.testing.assert_close(destination.proj_class.weight, model.proj_class.weight)
++    torch.testing.assert_close(destination.queries.queries, model.queries.queries)
++    assert torch.equal(encoder_before, destination.transformer.encoder.vit.conv_proj.weight)
++    mismatched = DETR(**settings(decoder_heads=2))
++    with pytest.raises(ValueError, match="decoder_heads"):
++        load_decoder_weights(mismatched, tmp_path / "checkpoint.pt")
++    with pytest.raises(ValueError, match="decoder_heads"):
++        load_weights(mismatched, tmp_path / "checkpoint.pt")
++
++
++def test_legacy_resnet_weights_and_cross_architecture_warm_start(tiny_vit, tmp_path):
++    baseline = DETR(**settings(architecture="resnet50"))
++    path = tmp_path / "legacy.pt"
++    torch.save(baseline.state_dict(), path)
++    restored = DETR(**settings(architecture="resnet50"))
++    load_weights(restored, path)
++    assert all(torch.equal(v, restored.state_dict()[k]) for k, v in baseline.state_dict().items())
++    new_model = DETR(**settings())
++    encoder_before = new_model.transformer.encoder.vit.conv_proj.weight.detach().clone()
++    load_decoder_weights(new_model, path)
++    assert torch.equal(new_model.queries.queries, baseline.queries.queries)
++    assert torch.equal(new_model.proj_class.weight, baseline.proj_class.weight)
++    assert torch.equal(encoder_before, new_model.transformer.encoder.vit.conv_proj.weight)
++
++
++def test_invalid_patch_sizes_and_cli_settings(tiny_vit):
++    model = DETR(**settings())
++    with pytest.raises(ValueError, match="multiples of 32"):
++        model(torch.randn(1, 3, 65, 96))
++    with pytest.raises(SystemExit):
++        parse_args(["--model", "vit_b_32", "--img_size", "640", "650"])
++    with pytest.raises(SystemExit):
++        parse_args(["--model", "resnet50", "--img_size", "800", "1344"])
++    args = parse_args(["--model", "vit_b_32", "--img_size", "640", "384"])
++    assert args.img_size == (640, 384) and args.output_dir == os.path.join("runs", "vit_b_32")
++    assert parse_args([]).model == "resnet50"
++
++
++@pytest.mark.integration
++@pytest.mark.skipif(os.environ.get("RUN_FULL_VIT_TESTS") != "1", reason="Opt in to full ViT-B/32 CPU/memory use")
++def test_full_vit_b32_forward_and_backward():
++    model = DETR(**settings())
++    assert model.transformer.encoder.hidden_dim == 768
++    assert len(model.transformer.encoder.vit.encoder.layers) == 12
++    logits, boxes = model(torch.randn(1, 3, 64, 96))
++    (logits.square().mean() + boxes.mean()).backward()
++    assert torch.isfinite(model.transformer.encoder.vit.conv_proj.weight.grad).all()
++    model.zero_grad(set_to_none=True)
++    model.eval()
++    with torch.no_grad():
++        logits, boxes = model(torch.randn(1, 3, 640, 640))
++    assert logits.shape == (1, 5, 4) and boxes.shape == (1, 5, 4)
++    assert model.feature_grid_size == (20, 20)
++
++
++@pytest.mark.pretrained
++@pytest.mark.skipif(os.environ.get("RUN_PRETRAINED_VIT_TESTS") != "1", reason="Opt in to pretrained weight download")
++def test_official_pretrained_weights_are_preserved():
++    model = DETR(**settings(pretrained=True)).eval()
++    # TorchVision migrates legacy MLP key names while loading the official
++    # checkpoint. Compare its loaded parameters, not the pre-migration keys.
++    reference = vit_module.vit_b_32(weights=vit_module.ViT_B_32_Weights.IMAGENET1K_V1).state_dict()
++    actual = model.transformer.encoder.vit.state_dict()
++    expected_keys = {key for key in reference if not key.startswith("heads.")}
++    assert actual.keys() == expected_keys
++    assert all(torch.equal(actual[key], reference[key]) for key in expected_keys)
++    del reference
++    with torch.no_grad():
++        logits, boxes = model(torch.randn(1, 3, 640, 640))
++    assert torch.isfinite(logits).all() and torch.isfinite(boxes).all()
++    assert model.feature_grid_size == (20, 20)
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -1,6 +1,8 @@
+ from argparse import Namespace, ArgumentParser
+ from time import perf_counter
+ from typing import Any, List, Tuple, Dict
++from pathlib import Path
++import random
+ 
+ import numpy as np
+ 
+@@ -8,29 +10,39 @@
+ from torch.utils.data import DataLoader
+ 
+ 
+-from src import DETR, DETRTrainer
++from src import DETR, DETRTrainer, load_weights, load_decoder_weights
+ from src import VOC, TrainTransform, ValidationTransform
+ 
+ 
+-def parse_args() -> Namespace:
++def parse_args(argv=None) -> Namespace:
+     parser = ArgumentParser(description="DETR training")
++
++    parser.add_argument("--model", choices=("resnet50", "vit_b_32"), default="resnet50")
++    parser.add_argument("--no_pretrained", action="store_true", help="Random feature-encoder initialization; also useful offline")
++    parser.add_argument("--freeze_encoder", action="store_true", help="Freeze ViT, or the ResNet backbone in baseline mode")
++    initializers = parser.add_mutually_exclusive_group()
++    initializers.add_argument("--weights", type=str, help="Strictly load complete detection weights; starts a new optimizer")
++    initializers.add_argument("--init_decoder_from", type=str, help="Warm-start matching queries, decoder and detection heads")
++    parser.add_argument("--output_dir", type=str, default=None, help="Default: runs/<model>; use a unique directory per experiment")
+ 
+     parser.add_argument("--d_model", type=int, default=256)
+     parser.add_argument("--encoder_layers", type=int, default=6)
+     parser.add_argument("--encoder_heads", type=int, default=8)
+     parser.add_argument("--decoder_layers", type=int, default=6)
+     parser.add_argument("--decoder_heads", type=int, default=8)
+-    parser.add_argument("--n_classes", type=int, default=21)            # n_classes + 1
++    parser.add_argument("--n_classes", type=int, default=21, help="Total outputs INCLUDING no-object: VOC=21")
+     parser.add_argument("--num_queries", type=int, default=100)
+     parser.add_argument("--ff_dim", type=int, default=2048)
+     parser.add_argument("--dropout", type=float, default=0.1)
+-    parser.add_argument("--max_tokens", type=float, default=400)        # (img_size[0] / 32) * (img_size[1] / 32)
++    parser.add_argument("--max_tokens", type=int, default=400, help="ResNet positional capacity; ignored by ViT")
+ 
+     parser.add_argument("--n_epochs", type=int, default=150)
+     parser.add_argument("--learning_rate", type=float, default=1e-4)
+     parser.add_argument("--learning_rate_backbone", type=float, default=5e-5)
++    parser.add_argument("--learning_rate_encoder", type=float, default=1e-5, help="ViT learning rate; baseline uses learning_rate_backbone")
+     parser.add_argument("--weight_decay", type=float, default=1e-4)
+     parser.add_argument("--weight_decay_backbone", type=float, default=1e-4)
++    parser.add_argument("--weight_decay_encoder", type=float, default=1e-4, help="ViT weight decay")
+     parser.add_argument("--batch_size", type=int, default=4)            # Limited by my compute
+     parser.add_argument("--lambda_l1", type=float, default=5.0)
+     parser.add_argument("--lambda_giou", type=float, default=2.0)
+@@ -50,12 +62,31 @@
+         default=False,
+         help="Download and extract VOC archives. Omit when the dataset is already extracted.",
+     )
+-    parser.add_argument("--img_size", type=tuple, default=(640, 640))
++    parser.add_argument("--img_size", type=int, nargs=2, default=(640, 640), metavar=("HEIGHT", "WIDTH"))
+ 
+     parser.add_argument("--save_every", type=int, default=5)
+     parser.add_argument("--eval_every", type=int, default=5)
+-    parser.add_argument("--verbose", default=True)
+-    return parser.parse_args()
++    parser.add_argument("--verbose", default=True)  # Preserve the existing argument.
++    parser.add_argument("--quiet", action="store_true")
++    args = parser.parse_args(argv)
++    args.img_size = tuple(args.img_size)
++    args.verbose = str(args.verbose).lower() not in {"false", "0", "no"} and not args.quiet
++    if any(size <= 0 for size in args.img_size):
++        parser.error("--img_size dimensions must be positive")
++    if args.model == "vit_b_32" and any(size % 32 for size in args.img_size):
++        parser.error("ViT-B/32 requires --img_size dimensions divisible by 32")
++    if args.model == "resnet50":
++        tokens = ((args.img_size[0] + 31) // 32) * ((args.img_size[1] + 31) // 32)
++        if args.max_tokens < tokens:
++            parser.error(f"This image size needs --max_tokens >= {tokens}")
++    for name in ("n_epochs", "batch_size", "save_every", "eval_every", "decay_lr_every"):
++        if getattr(args, name) < 1:
++            parser.error(f"--{name} must be positive")
++    if args.output_dir is None:
++        args.output_dir = str(Path("runs") / args.model)
++    if args.freeze_encoder and args.no_pretrained and not args.weights:
++        parser.error("Do not freeze a randomly initialized encoder; use pretrained weights or --weights")
++    return args
+ 
+ 
+ def collate_fn(batch: Any) -> Tuple[torch.Tensor, List[Dict]]:
+@@ -65,6 +96,7 @@
+ 
+ 
+ def set_seeds(seed: int) -> None:
++    random.seed(seed)
+     np.random.seed(seed)
+     torch.manual_seed(seed)
+ 
+@@ -81,7 +113,9 @@
+     log_startup("Setting random seeds...")
+     set_seeds(args.seed) 
+     
+-    log_startup("Building DETR (ResNet-50 weights may download if not cached)...")
++    log_startup(f"Building {args.model} DETR (pretrained weights may download if not cached)...")
++    if args.model == "vit_b_32":
++        log_startup("ViT uses 32x32 patches, 12 encoder layers, 12 heads and width 768; d_model controls the decoder.")
+     detr = DETR(
+         args.d_model, 
+         args.encoder_layers,
+@@ -92,8 +126,17 @@
+         args.num_queries,
+         args.ff_dim,
+         args.dropout,
+-        args.max_tokens
+-    )
++        args.max_tokens,
++        architecture=args.model,
++        pretrained=not args.no_pretrained and args.weights is None,
++        freeze_encoder=args.freeze_encoder,
++    )
++    if args.weights:
++        load_weights(detr, args.weights)
++        log_startup("Loaded all detection weights; starting a new optimizer.")
++    elif args.init_decoder_from:
++        load_decoder_weights(detr, args.init_decoder_from)
++        log_startup("Loaded queries, decoder and detection heads from the supplied checkpoint.")
+     log_startup("Model ready.")
+ 
+     pin_mem = True if args.num_workers > 0 else False
+@@ -153,6 +196,10 @@
+         eval_every=args.eval_every,
+         save_every=args.save_every,
+         verbose=args.verbose,
++        learning_rate_encoder=args.learning_rate_encoder,
++        weight_decay_encoder=args.weight_decay_encoder,
++        output_dir=args.output_dir,
++        run_config=vars(args),
+     ) 
+ 
+     log_startup(
