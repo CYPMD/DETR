@@ -3,6 +3,7 @@ from typing import Dict
 import os
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 import torch
 import torch.nn as nn
@@ -104,7 +105,7 @@ class DETRTrainer:
         if val_loader is not None: self.has_val = True 
         for epoch in range(1, self.n_epochs + 1): 
             
-            self.train_one_epoch(train_loader)
+            self.train_one_epoch(train_loader, epoch=epoch)
 
             if epoch % self.eval_every == 0:
                 self.evaluate(train_loader, epoch, True)
@@ -123,43 +124,65 @@ class DETRTrainer:
         if self.has_val: self.evaluate(val_loader, epoch, False)
         self._checkpoint()
 
-    def train_one_epoch(self, dataloader: DataLoader) -> None:
+    def train_one_epoch(self, dataloader: DataLoader, epoch: int|None=None) -> None:
         self.detr.train()
         n_aux = len(self.detr.transformer.decoder.layers) - 1 
-        
-        for imgs, targets in dataloader:
-            imgs = imgs.to(self.device)               # [B, 3, W_0, H_0]
+        description = "Training" if epoch is None else f"Epoch {epoch}/{self.n_epochs} | train"
+        n_batches = len(dataloader)
 
-            # Predict stuff
-            logits, boxes_pred = self.detr(imgs)      # [N, num_queries, n_classes], [N, num_queries, 4]
+        with tqdm(
+            dataloader,
+            desc=description,
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            disable=not self.verbose,
+        ) as progress:
+            for step, (imgs, targets) in enumerate(progress, start=1):
+                imgs = imgs.to(self.device)               # [B, 3, W_0, H_0]
 
-            # Compute loss 
-            loss, _, _ = self.criterion(logits, boxes_pred, targets)
+                # Predict stuff
+                logits, boxes_pred = self.detr(imgs)      # [N, num_queries, n_classes], [N, num_queries, 4]
 
-            # Compute auxilary loss
-            loss_aux_total = 0.0
-            for n in range(n_aux): 
-                x_dec = self.detr.transformer.decoder.outs_[n] 
-                logits_aux = self.detr.proj_class(x_dec)
-                boxes_aux = self.detr.proj_bbox(x_dec)
-                loss_aux, _, _ = self.criterion(logits_aux, boxes_aux, targets)
-                loss_aux_total += loss_aux
+                # Compute loss
+                loss, _, _ = self.criterion(logits, boxes_pred, targets)
 
-            # Compute final loss
-            loss = loss + loss_aux_total
+                # Compute auxiliary loss
+                loss_aux_total = 0.0
+                for n in range(n_aux):
+                    x_dec = self.detr.transformer.decoder.outs_[n]
+                    logits_aux = self.detr.proj_class(x_dec)
+                    boxes_aux = self.detr.proj_bbox(x_dec)
+                    loss_aux, _, _ = self.criterion(logits_aux, boxes_aux, targets)
+                    loss_aux_total += loss_aux
 
-            # Backpropagation
-            self.optimizer.zero_grad()
+                # Compute final loss
+                loss = loss + loss_aux_total
 
-            loss.backward()
+                # Backpropagation
+                self.optimizer.zero_grad()
 
-            if self.clip_grad_norm is not None:
-                nn.utils.clip_grad_norm_(self.detr.parameters(), self.clip_grad_norm) 
+                loss.backward()
 
-            self.optimizer.step()
+                if self.clip_grad_norm is not None:
+                    nn.utils.clip_grad_norm_(self.detr.parameters(), self.clip_grad_norm)
+
+                self.optimizer.step()
+
+                # Sample the displayed loss periodically to limit CUDA synchronization.
+                if self.verbose and (step == 1 or step % 20 == 0 or step == n_batches):
+                    progress.set_postfix(
+                        loss=f"{loss.detach().item():.4f}",
+                        refresh=False,
+                    )
 
     def evaluate(self, dataloader: DataLoader, epoch: int, train_set: bool = False) -> None:
-        history = self.evaluator.evaluate(dataloader)
+        split = "train" if train_set else "val"
+        history = self.evaluator.evaluate(
+            dataloader,
+            description=f"Epoch {epoch}/{self.n_epochs} | eval {split}",
+            verbose=self.verbose,
+        )
         self._append_stats(history, epoch, train_set)
 
     def _append_stats(self, history: Dict[str, list], epoch: int, train_set: bool = False) -> None:
@@ -172,6 +195,9 @@ class DETRTrainer:
         stats["map50"].append(history["map50"])
  
     def _checkpoint(self) -> None:
+        if self.verbose:
+            tqdm.write("Saving checkpoint and metric reports...")
+
         lr = self.learning_rate 
         wd = self.weight_decay
         n_params = self.n_params
@@ -189,6 +215,9 @@ class DETRTrainer:
         if self.has_val: 
             file_name = f"DETR-Report-Val-Lr{lr}-WeightDecay{wd}-Params{n_params}.csv"
             pd.DataFrame.from_dict(self.stats_val).to_csv(file_name, index=False)
+
+        if self.verbose:
+            tqdm.write(f"Checkpoint saved: {file_path}")
 
     def _print_stats(self, epoch: int) -> None:
         if self.has_val: 
