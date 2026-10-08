@@ -1,6 +1,7 @@
 from typing import Dict, Tuple, List
 
 from torchmetrics import detection
+from tqdm.auto import tqdm
 
 import torch
 from torch.utils.data import DataLoader
@@ -28,7 +29,12 @@ class DETREvaluator:
         self.criterion.to(self.device)
     
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
+    def evaluate(
+            self,
+            dataloader: DataLoader,
+            description: str="Evaluating",
+            verbose: bool=True,
+    ) -> Dict[str, float]:
         self.detr.eval()
 
         metric = detection.MeanAveragePrecision(box_format="cxcywh", iou_type="bbox")
@@ -37,25 +43,41 @@ class DETREvaluator:
         total_loss_ce = 0.0
         total_loss_bbox = 0.0
 
-        for n, (imgs, targets) in enumerate(dataloader):
-            imgs = imgs.to(self.device)
+        n_batches = len(dataloader)
+        with tqdm(
+            dataloader,
+            desc=description,
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            disable=not verbose,
+        ) as progress:
+            for n, (imgs, targets) in enumerate(progress):
+                imgs = imgs.to(self.device)
 
-            # Predict stuff 
-            logits, boxes_pred = self.detr(imgs)
+                # Predict stuff
+                logits, boxes_pred = self.detr(imgs)
 
-            # Compute matching loss
-            loss, loss_bbox, loss_ce = self.criterion(logits, boxes_pred, targets)
-            
-            # Update losses
-            total_loss += (loss.item() - total_loss) / (n + 1)
-            total_loss_ce += (loss_ce.item() - total_loss_ce) / (n + 1)
-            total_loss_bbox += (loss_bbox.item() - total_loss_bbox) / (n + 1)
+                # Compute matching loss
+                loss, loss_bbox, loss_ce = self.criterion(logits, boxes_pred, targets)
 
-            # Update class and box metrics
-            preds_lst, targets_lst = self._prepare_map_inputs(imgs, logits, boxes_pred, targets)
-            metric.update(preds_lst, targets_lst)
+                # Update losses
+                total_loss += (loss.item() - total_loss) / (n + 1)
+                total_loss_ce += (loss_ce.item() - total_loss_ce) / (n + 1)
+                total_loss_bbox += (loss_bbox.item() - total_loss_bbox) / (n + 1)
 
+                # Update class and box metrics
+                preds_lst, targets_lst = self._prepare_map_inputs(imgs, logits, boxes_pred, targets)
+                metric.update(preds_lst, targets_lst)
+
+                if verbose and (n == 0 or (n + 1) % 20 == 0 or n + 1 == n_batches):
+                    progress.set_postfix(loss=f"{total_loss:.4f}", refresh=False)
+
+        if verbose:
+            tqdm.write(f"{description}: computing mAP...")
         result = metric.compute()
+        if verbose:
+            tqdm.write(f"{description}: mAP computation finished.")
         
         stats = {
             "loss": total_loss,
